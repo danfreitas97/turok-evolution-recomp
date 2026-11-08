@@ -69,6 +69,19 @@ void theme_present(HDC dc)
 
 /* --------------------------------------------------------------- text */
 
+static void draw_utf8(const char *text, RECT *rect, UINT flags)
+{
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    UINT cp = CP_UTF8;
+    wchar_t *wide;
+    if (!count) { cp = CP_ACP; count = MultiByteToWideChar(cp, 0, text, -1, NULL, 0); }
+    if (!count) return;
+    wide = (wchar_t *)malloc((size_t)count * sizeof *wide);
+    if (!wide) return;
+    if (MultiByteToWideChar(cp, 0, text, -1, wide, count)) DrawTextW(g_dc, wide, -1, rect, flags);
+    free(wide);
+}
+
 void theme_text(ThemeRect r, const char *text, int size, int weight,
                 COLORREF colour, ThemeAlign align)
 {
@@ -96,7 +109,7 @@ void theme_text(ThemeRect r, const char *text, int size, int weight,
     if (align == THEME_CENTRE) flags |= DT_CENTER;
     else if (align == THEME_RIGHT) flags |= DT_RIGHT;
 
-    DrawTextA(g_dc, text, -1, &rc, flags);
+    draw_utf8(text, &rc, flags | DT_END_ELLIPSIS);
     SelectObject(g_dc, old);
     DeleteObject(font);
 }
@@ -120,7 +133,7 @@ void theme_text_wrapped(ThemeRect r, const char *text, int size, COLORREF colour
     rc.top = r.y;
     rc.right = r.x + r.w;
     rc.bottom = r.y + r.h;
-    DrawTextA(g_dc, text, -1, &rc, DT_WORDBREAK | DT_TOP | DT_NOPREFIX);
+    draw_utf8(text, &rc, DT_WORDBREAK | DT_TOP | DT_NOPREFIX);
     SelectObject(g_dc, old);
     DeleteObject(font);
 }

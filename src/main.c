@@ -439,10 +439,16 @@ static int title_main(int argc, char **argv)
      * unless this says where. */
     host_setup_output(g_log_path, sizeof g_log_path);
 
-    /* Unbuffered output for immediate visibility during debugging, and so a
-     * crash keeps the tail of the log rather than losing it in a buffer. */
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+    /* Unbuffered CRT output can stall the render thread in tiny WriteFile
+     * calls. Batch normal logs; crash paths and periodic reports flush them.
+     * Immediate logging remains available for crash diagnosis. */
+    {
+        static char stdout_buffer[16384], stderr_buffer[65536];
+        const char *immediate = getenv("RECOMP_LOG_UNBUFFERED");
+        int unbuffered = immediate && *immediate && *immediate != '0';
+        setvbuf(stdout, stdout_buffer, unbuffered ? _IONBF : _IOFBF, sizeof stdout_buffer);
+        setvbuf(stderr, stderr_buffer, unbuffered ? _IONBF : _IOFBF, sizeof stderr_buffer);
+    }
 
     printf("=== Turok: Evolution - Static Recompilation ===\n");
     printf("Loading XBE...\n");

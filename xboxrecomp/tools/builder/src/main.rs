@@ -189,7 +189,7 @@ fn fail<T>(message: impl Into<String>) -> Result<T, Failure> {
 
 // ── the player's folder ─────────────────────────────────────────────────────
 
-fn user_dir(title_id: &str) -> Result<PathBuf, Failure> {
+fn default_user_dir(title_id: &str) -> Result<PathBuf, Failure> {
     if let Some(d) = std::env::var_os("XBOXRECOMP_BUILD_DIR") {
         return Ok(PathBuf::from(d).join(title_id));
     }
@@ -217,6 +217,22 @@ fn user_dir(title_id: &str) -> Result<PathBuf, Failure> {
         },
     };
     Ok(data.join("xboxrecomp").join("builds").join(title_id))
+}
+
+fn user_dir(title_id: &str) -> Result<PathBuf, Failure> {
+    let base = default_user_dir(title_id)?;
+    if let Ok(path) = fs::read_to_string(base.join("install-location.txt")) {
+        let path = PathBuf::from(path.trim());
+        if path.is_absolute() { return Ok(path); }
+    }
+    Ok(base)
+}
+
+fn remember_install(title_id: &str, user: &Path) -> Result<(), Failure> {
+    let base = default_user_dir(title_id)?;
+    fs::create_dir_all(&base)
+        .and_then(|_| fs::write(base.join("install-location.txt"), user.to_string_lossy().as_bytes()))
+        .or_else(|e| fail(format!("cannot remember installation folder: {e}")))
 }
 
 /// The executable a target name builds: name.exe on Windows.
@@ -682,6 +698,7 @@ fn run(cmd: &mut Command, log: &Path, what: &str, mut on_line: impl FnMut(&str))
     let errs = std::thread::spawn(move || {
         for line in BufReader::new(err).lines().map_while(Result::ok) {
             let _ = writeln!(log2.lock().unwrap(), "{line}");
+            emit(json!({"event": "log", "message": line.chars().take(500).collect::<String>()}));
             let mut t = tail2.lock().unwrap();
             t.push_back(line);
             if t.len() > 25 { t.pop_front(); }
@@ -694,6 +711,7 @@ fn run(cmd: &mut Command, log: &Path, what: &str, mut on_line: impl FnMut(&str))
             t.push_back(line.clone());
             if t.len() > 25 { t.pop_front(); }
         }
+        emit(json!({"event": "log", "message": line.chars().take(500).collect::<String>()}));
         on_line(&line);
     }
     let _ = errs.join();
@@ -1025,10 +1043,40 @@ fn process_alive(pid: u32) -> bool {
 
 // ── commands ────────────────────────────────────────────────────────────────
 
-fn cmd_build(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> {
-    let user = user_dir(&release.title_id)?;
+fn validate_destination(user: &Path) -> Result<(), Failure> {
+    let mut entries = fs::read_dir(user).or_else(|e| fail(format!("cannot read installation folder: {e}")))?;
+    if entries.next().is_none() { return Ok(()); }
+    if let Some(stamp) = read_json::<Stamp>(&user.join("build.json")) {
+        return if stamp.title_id == "41430004" { Ok(()) }
+            else { fail("This folder contains another game. Choose a separate folder for Turok.") };
+    }
+    if fs::read_to_string(user.join(".turok-install")).ok().as_deref() != Some("41430004") {
+        return fail("Choose an empty installation folder, or an existing Turok installation.");
+    }
+
+    Ok(())
+}
+
+fn cmd_build(release: &Release, source: Option<PathBuf>, install_dir: Option<PathBuf>) -> Result<(), Failure> {
+    let user = match install_dir {
+        Some(path) if path.is_absolute() => path,
+        Some(_) => return fail("Choose an absolute installation folder."),
+        None => user_dir(&release.title_id)?,
+    };
     fs::create_dir_all(&user).or_else(|e| fail(format!("cannot create {}: {e}", user.display())))?;
+    let user = fs::canonicalize(&user).map(plain)
+        .or_else(|e| fail(format!("cannot resolve installation folder: {e}")))?;
+    if let Some(ref source) = source {
+        let source = fs::canonicalize(source).map(plain)
+            .or_else(|e| fail(format!("cannot open source: {e}")))?;
+        if source.is_dir() && (user.starts_with(&source) || source.starts_with(&user)) {
+            return fail("Choose an installation folder separate from the source game folder.");
+        }
+    }
+    validate_destination(&user)?;
     let _lock = BuildLock::take(&user)?;
+    fs::write(user.join(".turok-install"), "41430004")
+        .or_else(|e| fail(format!("cannot write installation folder: {e}")))?;
     let source = match source {
         Some(s) => s,
         None => match read_json::<SourceRecord>(&user.join("source.json")) {
@@ -1049,6 +1097,7 @@ fn cmd_build(release: &Release, source: Option<PathBuf>) -> Result<(), Failure> 
     lift(release, &image, &user, &log)?;
     let built = build(release, &user, &log)?;
     let exe = install(release, &user, &built, &image.sha1)?;
+    remember_install(&release.title_id, &user)?;
     emit(json!({"event": "done", "exe": exe, "game_dir": user.join("game")}));
     Ok(())
 }
@@ -1133,7 +1182,7 @@ fn cmd_status(release: &Release) -> Result<(), Failure> {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: xboxrecomp-build build [--source <iso or folder>] [--release <dir>]\n       \
+    eprintln!("usage: xboxrecomp-build build [--source <iso or folder>] [--install-dir <folder>] [--release <dir>]\n       \
                xboxrecomp-build relink --source <iso or folder> [--release <dir>]\n       \
                xboxrecomp-build status [--release <dir>]");
     ExitCode::from(64)
@@ -1142,10 +1191,14 @@ fn usage() -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().cloned() else { return usage() };
-    let (mut source, mut release_dir) = (None, None);
+    let (mut source, mut release_dir, mut install_dir) = (None, None, None);
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
+            "--install-dir" => {
+                install_dir = it.next().map(PathBuf::from);
+                if install_dir.is_none() { return usage(); }
+            }
             "--source" => source = it.next().map(PathBuf::from),
             "--release" => release_dir = it.next().map(PathBuf::from),
             _ => return usage(),
@@ -1159,7 +1212,7 @@ fn main() -> ExitCode {
     });
     let result = Release::load(&release_dir).map_err(|m| Failure { message: m, code: 1 })
         .and_then(|release| match command.as_str() {
-            "build" => cmd_build(&release, source),
+            "build" => cmd_build(&release, source, install_dir),
             "relink" => cmd_relink(&release, source),
             "status" => cmd_status(&release),
             _ => fail(format!("unknown command {command}")),
@@ -1183,6 +1236,38 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn subprocess_logs_include_stdout_and_stderr() {
+        let d = scratch("live-log");
+        let log = d.join("build.log");
+        let mut cmd;
+        if cfg!(windows) {
+            cmd = Command::new("cmd"); cmd.args(["/C", "echo output-line & echo error-line 1>&2"]);
+        } else {
+            cmd = Command::new("sh"); cmd.args(["-c", "echo output-line; echo error-line >&2"]);
+        }
+        let mut observed = Vec::new();
+        run(&mut cmd, &log, "test logger", |line| observed.push(line.to_string())).unwrap();
+        assert!(observed.iter().any(|line| line.contains("output-line")));
+        let saved = fs::read_to_string(&log).unwrap();
+        assert!(saved.contains("output-line") && saved.contains("error-line"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn installation_refuses_unrelated_files_and_allows_retry() {
+        let d = scratch("destination");
+        assert!(validate_destination(&d).is_ok());
+        fs::write(d.join("personal.txt"), b"keep").unwrap();
+        assert!(validate_destination(&d).is_err());
+        fs::remove_file(d.join("personal.txt")).unwrap();
+        fs::write(d.join("build.log"), b"unrelated log").unwrap();
+        assert!(validate_destination(&d).is_err());
+        fs::write(d.join(".turok-install"), "41430004").unwrap();
+        assert!(validate_destination(&d).is_ok());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

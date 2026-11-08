@@ -14,6 +14,9 @@
   "include": [
     "assets/launcher/background.jpg",
     "assets/launcher/logo.png",
-    "assets/launcher/icon.ico"
-  ]
+    "assets/launcher/icon.ico",
+    "assets/launcher/icon-256.png"
+  ],
+  "icon": "assets/launcher/icon-256.png",
+  "icon_ico": "assets/launcher/icon.ico"
 }

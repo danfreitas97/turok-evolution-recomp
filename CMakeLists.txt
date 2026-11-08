@@ -133,3 +133,11 @@ if(COMMAND recomp_add_launcher)
         BRAND_NEWS_TITLE "USA (NTSC) port in progress"
         BRAND_NEWS_TEXT  "Built from your own disc on your own computer. Online play is in development.")
 endif()
+
+# Keep the same branded icon beside the executables for Windows shortcuts.
+if(WIN32)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/launcher/icon.ico"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/turok.ico")
+endif()

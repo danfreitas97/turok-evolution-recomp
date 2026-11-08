@@ -56,6 +56,7 @@
 HLE_GROUP(audio)
 #include "xbox_adpcm.h"
 #include "audio_output.h"
+#include "audio_pcm_surround.h"
 #include "hle_dsound_3d.h"
 
 /* kernel_bridge.c: the dispatch table, for the completion callback. */
@@ -339,6 +340,7 @@ static int acquire_voice(Stream *s)
 
 /* Decoded bytes per second and per frame. Output is 16-bit for ADPCM. */
 static uint32_t out_bits(const Stream *s) { return s->tag == TAG_ADPCM ? 16u : s->bits; }
+static uint32_t host_channels(const Stream *s) { return s->channels == 6u ? 2u : s->channels; }
 static uint32_t frame_bytes(const Stream *s) { return s->channels * out_bits(s) / 8u; }
 static uint64_t bytes_per_ms_x1000(const Stream *s)
 {
@@ -403,7 +405,8 @@ static void sync_to_host(Stream *s, uint64_t now)
     if (!recomp_audio_output_position(slot_of(s), &played, &queued) || queued == 0)
         return;
 
-    pos = s->play_origin + played;
+    /* The backend counts stereo bytes; packet positions remain source bytes. */
+    pos = s->play_origin + played / (host_channels(s) * out_bits(s) / 8u) * frame_bytes(s);
     if (pos > s->queued)
         pos = s->queued;
     if (s->play_anchored) {
@@ -575,7 +578,7 @@ static void pump(Stream *s, uint64_t now)
         Packet *p = NULL;
         int i;
         uint64_t within, want;
-        uint32_t bytes;
+        uint32_t bytes, host_bytes;
 
         for (i = 0; i < s->count; i++) {
             Packet *q = &s->packets[(s->head + i) % MAX_PACKETS];
@@ -631,6 +634,9 @@ static void pump(Stream *s, uint64_t now)
             }
             memcpy(pcm, HLE_PTR(p->data + (uint32_t)within), bytes);
         }
+        host_bytes = bytes;
+        if (s->channels == 6u)
+            host_bytes = recomp_pcm16_surround_to_stereo(pcm, bytes);
         /* Only sound the host actually took counts as sent. A full queue is
           * normal -- the lead is deliberately more than one chunk -- and
           * stepping over the refusal would delete that sound from the stream
@@ -641,7 +647,7 @@ static void pump(Stream *s, uint64_t now)
              * submitted however fast it plays. */
             RecompAudioMix mix;
             uint32_t route = 0u;
-            if (hle_ds3d_mix(s->iface, s->channels, stream_volume(s), 0, &mix, &route)) {
+            if (hle_ds3d_mix(s->iface, host_channels(s), stream_volume(s), 0, &mix, &route)) {
                 uint32_t asked = hle_ds3d_stream_frequency(s->iface);
                 mix.ratio *= asked ? (float)asked / (float)s->rate : 1.0f;
                 recomp_audio_output_set_mix(slot_of(s), &mix);
@@ -653,7 +659,7 @@ static void pump(Stream *s, uint64_t now)
                 s->mixed = 0;
             }
         }
-        if (!recomp_audio_output_submit(slot_of(s), pcm, bytes, s->rate, s->channels,
+        if (!recomp_audio_output_submit(slot_of(s), pcm, host_bytes, s->rate, host_channels(s),
                                         out_bits(s), stream_volume(s)))
             break;
         s->sent += bytes;
@@ -856,10 +862,11 @@ static void record_stream(uint32_t iface, uint32_t desc)
     s->context     = context;
     /* Whether it is 3D and the mix bins it starts with (hle_dsound_3d.c). */
     hle_ds3d_created(iface, HLE_MEM32(desc), HLE_MEM32(desc + 0xCu));
-    s->output = s->channels >= 1u && s->channels <= 2u &&
-                s->rate >= 1000u && s->rate <= 200000u &&
-                ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
-                 (s->tag == TAG_ADPCM && s->bits == 4u));
+    s->output = s->rate >= 1000u && s->rate <= 200000u &&
+                ((s->channels >= 1u && s->channels <= 2u &&
+                  ((s->tag == TAG_PCM && (s->bits == 8u || s->bits == 16u)) ||
+                   (s->tag == TAG_ADPCM && s->bits == 4u))) ||
+                 (s->channels == 6u && s->tag == TAG_PCM && s->bits == 16u));
     if (said < 24 || stream_log()) {
         said++;
         if (stream_log())

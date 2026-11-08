@@ -121,6 +121,7 @@ void theme_button(ThemeRect r, const char *label, int primary, double lit);
  * knob at that end. */
 void theme_switch(ThemeRect r, int on, double lit);
 /* A filled dot, for a status line. */
+void theme_flag(ThemeRect r, int brazil);
 void theme_dot(int cx, int cy, int radius, COLORREF colour);
 
 #endif /* XBOXRECOMP_LAUNCHER_THEME_H */

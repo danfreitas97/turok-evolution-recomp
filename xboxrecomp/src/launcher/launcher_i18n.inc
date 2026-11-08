@@ -1,0 +1,227 @@
+/* English / Brazilian Portuguese launcher text. UTF-8; log output stays verbatim. */
+#include <stdarg.h>
+static int g_language;
+static const struct { const char *en, *pt; } k_translations[] = {
+    {"PLAY", "JOGAR"},
+    {"Settings", "Configurações"},
+    {"Controls", "Controles"},
+    {"GAME", "JOGO"},
+    {"NEWS", "NOVIDADES"},
+    {"CONTROLS", "CONTROLES"},
+    {"Video", "Vídeo"},
+    {"Input", "Controles"},
+    {"About", "Sobre"},
+    {"Ready to play", "Pronto para jogar"},
+    {"Your game files are not set up yet", "Os arquivos do jogo ainda não estão prontos"},
+    {"Fullscreen", "Tela cheia"},
+    {"In a window", "Em uma janela"},
+    {"Resolution", "Resolução"},
+    {"Widescreen", "Tela ampla"},
+    {"Texture sharpness", "Nitidez das texturas"},
+    {"Frame rate", "Taxa de quadros"},
+    {"Show frame rate", "Mostrar FPS"},
+    {"Variable refresh rate", "Taxa de atualização variável"},
+    {"Frame interpolation", "Interpolação de quadros"},
+    {"Adaptive (as the console)", "Adaptável (como no console)"},
+    {"Uncapped", "Sem limite"},
+    {"On", "Ligado"},
+    {"Off", "Desligado"},
+    {"Nothing", "Nenhum"},
+    {"Keyboard", "Teclado"},
+    {"Editing", "Editando"},
+    {"Read from", "Usar dispositivo"},
+    {"Controllers", "Controles"},
+    {"Mouse look", "Câmera com o mouse"},
+    {"Mouse sensitivity", "Sensibilidade do mouse"},
+    {"Reset this controller", "Redefinir este controle"},
+    {"Back to the defaults", "Restaurar os padrões"},
+    {"Xbox controllers only (XInput)", "Somente controles Xbox (XInput)"},
+    {"All controllers (SDL3)", "Todos os controles (SDL3)"},
+    {"On  (the mouse moves controller 1's right stick)", "Ligado (mouse controla o analógico direito do controle 1)"},
+    {"press something...", "pressione um botão..."},
+    {"press a key or click...", "pressione uma tecla ou clique..."},
+    {"Controller %d", "Controle %d"},
+    {"Gamepad %d  (%s)", "Controle %d  (%s)"},
+    {"Gamepad %d  (not plugged in)", "Controle %d  (desconectado)"},
+    {"%s frames a second", "%s quadros por segundo"},
+    {"%dx resolution   |   %s   |   %s%s", "Resolução %dx   |   %s   |   %s%s"},
+    {"Your copy of the game", "Instale sua cópia do jogo"},
+    {"The game's files have moved", "Os arquivos do jogo foram movidos"},
+    {"Build the game again", "Recompilar o jogo"},
+    {"Type or paste a path, or choose one below", "Digite ou cole um caminho, ou escolha abaixo"},
+    {"DISC IMAGE...", "ISO DO JOGO..."},
+    {"GAME FOLDER...", "PASTA DO JOGO..."},
+    {"INSTALL", "INSTALAR"},
+    {"INSTALLATION FOLDER", "PASTA DE INSTALAÇÃO"},
+    {"CHANGE...", "ALTERAR..."},
+    {"BUILD AGAIN", "RECOMPILAR"},
+    {"LINK AGAIN", "LOCALIZAR NOVAMENTE"},
+    {"Starting", "Iniciando"},
+    {"Building the game", "Instalando o jogo"},
+    {"Finding the game's files", "Localizando os arquivos do jogo"},
+    {"Preparing the game files", "Preparando os arquivos do jogo"},
+    {"Checking the disc", "Verificando o disco"},
+    {"Translating the game to C", "Preparando o código do jogo"},
+    {"Setting up the build", "Preparando a compilação"},
+    {"Compiling", "Compilando"},
+    {"Finishing", "Finalizando"},
+    {"LIVE LOG  -  full details in build.log", "LOG AO VIVO  -  detalhes completos em build.log"},
+    {"CANCEL", "CANCELAR"},
+    {"B  Cancel", "B  Cancelar"},
+    {"Esc  Cancel", "Esc  Cancelar"},
+    {"Build complete", "Instalação concluída"},
+    {"Files found", "Arquivos encontrados"},
+    {"This disc can't be used", "Este disco não é compatível"},
+    {"The game's files were not linked", "Não foi possível vincular os arquivos"},
+    {"The build did not finish", "A instalação não foi concluída"},
+    {"Choose the disc image or the game's folder first.", "Primeiro escolha a ISO ou a pasta do jogo."},
+    {"No file dialog here: type or paste the path in the box.", "Digite ou cole o caminho no campo."},
+    {"Nothing chosen. If no dialog appeared, type or paste the path in the box.", "Nada selecionado. Se a janela não abriu, digite ou cole o caminho."},
+    {"Keep the existing installation folder when updating or repairing.", "Mantenha a pasta atual ao atualizar ou reparar a instalação."},
+    {"Cancelled. Build again to start over.", "Cancelado. Clique em instalar para tentar novamente."},
+    {"Cancelled. Choose the game's files to try again.", "Cancelado. Escolha os arquivos do jogo para tentar novamente."},
+    {"Choose your disc image (.iso) or the folder the game's files are in. The game is built from it once, here on this computer, which takes a few minutes. An image is extracted to your installation folder; a folder is linked, never copied or changed.", "Escolha sua ISO ou a pasta com os arquivos do jogo e o destino da instalação. O processo é automático e leva alguns minutos. A ISO é extraída no destino; uma pasta de origem é vinculada e deve permanecer no mesmo lugar."},
+    {"This happens once. Later starts go straight to the game. It is building from your own copy, on this computer.", "Isso só é necessário na instalação ou atualização. O jogo é compilado a partir da sua própria cópia, neste computador."},
+    {"Linking the game to its files again. Nothing is rebuilt.", "Vinculando novamente os arquivos do jogo. Não é necessário recompilar."},
+    {"A  Choose      B  Quit      D-pad  Move", "A  Escolher      B  Sair      Direcional  Mover"},
+    {"Enter  Choose      Esc  Quit      Type or paste a path in the box", "Enter  Escolher      Esc  Sair      Digite ou cole o caminho no campo"},
+    {"Fan project, not affiliated with Acclaim or the owners of Turok.", "Projeto de fãs, sem vínculo com a Acclaim ou os donos de Turok."},
+    {"USA (NTSC) port in progress", "Port da versão USA (NTSC) em desenvolvimento"},
+    {"Built from your own disc on your own computer. Online play is in development.", "Compilado a partir do seu disco no seu computador. O modo online está em desenvolvimento."},
+    {"A plays, B quits. The D-pad moves between the buttons. Controls opens the bindings for every controller and the keyboard.", "A joga, B sai. Use o direcional para navegar. Em Controles você configura os botões do controle e as teclas."},
+    {"Enter plays, Esc quits, the arrows move between the buttons. A controller works here too.", "Enter joga, Esc sai e as setas navegam entre os botões. Você também pode usar um controle."},
+    {"Render larger than the console, then filter back down. Costs little.", "Renderiza em uma resolução maior e reduz a imagem para melhorar a nitidez."},
+    {"Play at 16:9. The camera is widened to match, so you see more to the sides.", "Jogue em 16:9. A câmera amplia o campo de visão para mostrar mais nas laterais."},
+    {"Play at 16:9, in the game's own widescreen mode.", "Jogue em 16:9 usando o modo de tela ampla do jogo."},
+    {"Play at 16:9, in the game's own widescreen mode. A game without one will look stretched.", "Jogue em 16:9. Jogos sem suporte a tela ampla podem ficar esticados."},
+    {"Sharpen textures seen at a glancing angle: floors, walls, roads.", "Melhora a nitidez de texturas vistas de lado, como pisos e paredes."},
+    {"Adaptive paces the game at 60, as the console did. This game keeps time, so it plays right faster too. F10 changes it while playing.", "Adaptável mantém 60 FPS, como no console. Este jogo também permite taxas maiores. F10 altera a opção durante o jogo."},
+    {"Adaptive paces the game the way the console did. F10 changes it while playing.", "Adaptável mantém o ritmo do console. F10 altera a opção durante o jogo."},
+    {"Start with the counter on screen. F9 toggles it while playing.", "Mostra o contador de FPS. Use F9 para ativar ou desativar durante o jogo."},
+    {"Fill the screen, without a window frame. Alt+Enter switches in game.", "Ocupa a tela toda, sem bordas. Alt+Enter alterna durante o jogo."},
+    {"In fullscreen on a G-SYNC or FreeSync display: an even 60, no judder.", "Sincroniza a atualização em tela cheia em monitores com G-SYNC ou FreeSync."},
+    {"Draw frames between the game's own: smoother motion while the game still runs at 60. Best with Variable refresh rate.", "Cria quadros intermediários para suavizar o movimento. Funciona melhor com taxa de atualização variável."},
+    {"Press a key, or click any mouse button. Escape cancels.", "Pressione uma tecla ou botão do mouse. Esc cancela."},
+    {"Press what you want this to be. Escape cancels.", "Pressione o botão desejado. Esc cancela."},
+    {"Which of the four controllers these bindings are for.", "Escolha qual dos quatro controles deseja configurar."},
+    {"What this controller reads: a gamepad, the keyboard, or nothing.", "Escolha um controle físico, o teclado ou nenhum dispositivo."},
+    {"Put this controller back to the built-in mapping.", "Restaura os botões padrão deste controle."},
+    {"All controllers reads Xbox, PlayStation, Switch and most other pads. Xbox controllers only is the older XInput path, for a pad that misbehaves. Every game uses this.", "Todos os controles aceita Xbox, PlayStation, Switch e outros. Use XInput se um controle Xbox apresentar problemas."},
+    {"Moving the mouse turns controller 1's right stick, and the stick itself still works. Click in the game to give it the pointer; switching away gives it back. This game only.", "O mouse move o analógico direito do controle 1. Clique na janela do jogo para capturar o cursor; alterne de janela para liberá-lo."},
+    {"How far a movement of the mouse pushes the stick: higher turns faster. A or Enter goes back to the default. This game only.", "Define a velocidade da câmera com o mouse. A ou Enter restaura o padrão."},
+    {"Left and right choose the controller or the keyboard and mouse column. A or Enter rebinds. Bindings are shared by every game.", "Esquerda e direita escolhem a coluna do controle ou teclado e mouse. A ou Enter altera o botão."},
+    {"A native build of an Xbox game, not an emulator. Settings chosen here are written to a file the game reads when it starts.", "Uma recompilação nativa do jogo de Xbox. As configurações são salvas e aplicadas quando o jogo inicia."},
+    {"Settings  %s", "Configurações  %s"},
+    {"Settings  (nowhere to write)", "Configurações  (sem destino de gravação)"},
+    {"Title id  %08X", "ID do jogo  %08X"},
+    {"Game      %s", "Jogo      %s"},
+    {"Game      %s/%s (built from %s)", "Jogo      %s/%s (compilado de %s)"},
+    {"Files     %s", "Arquivos  %s"},
+    {"Files     not found -- settings will not reach the game", "Arquivos não encontrados: configurações não serão aplicadas"},
+    {"Host a session", "Criar uma sessão"},
+    {"Join a session", "Entrar em uma sessão"},
+    {"Host's address", "Endereço do anfitrião"},
+    {"Session code", "Código da sessão"},
+    {"Open the router", "Abrir porta no roteador"},
+    {"Port", "Porta"},
+    {"none", "nenhum"},
+    {"System Link", "Jogo em rede"},
+    {"Copied", "Copiado"},
+    {"Left trigger", "Gatilho esquerdo"},
+    {"Right trigger", "Gatilho direito"},
+    {"D-pad up", "Direcional para cima"},
+    {"D-pad down", "Direcional para baixo"},
+    {"D-pad left", "Direcional para esquerda"},
+    {"D-pad right", "Direcional para direita"},
+    {"Black", "Preto"},
+    {"White", "Branco"},
+    {"Back", "Voltar"},
+    {"Left stick up", "Analógico esquerdo para cima"},
+    {"Left stick down", "Analógico esquerdo para baixo"},
+    {"Left stick left", "Analógico esquerdo para esquerda"},
+    {"Left stick right", "Analógico esquerdo para direita"},
+    {"Left stick press", "Clique no analógico esquerdo"},
+    {"Right stick up", "Analógico direito para cima"},
+    {"Right stick down", "Analógico direito para baixo"},
+    {"Right stick left", "Analógico direito para esquerda"},
+    {"Right stick right", "Analógico direito para direita"},
+    {"Right stick press", "Clique no analógico direito"},
+    {"A  Play      B  Back      LB RB  Change tab      D-pad  Move", "A  Jogar      B  Voltar      LB RB  Abas      Direcional  Mover"},
+    {"A  Play      B  Quit      LB RB  Change tab      D-pad  Move", "A  Jogar      B  Sair      LB RB  Abas      Direcional  Mover"},
+    {"Enter  Play      Esc  Back      Tab  Change tab      Arrows  Move", "Enter  Jogar      Esc  Voltar      Tab  Abas      Setas  Mover"},
+    {"Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move", "Enter  Jogar      Esc  Sair      Tab  Abas      Setas  Mover"},
+    {"The game is ready", "O jogo está pronto"},
+    {"%s was built from your copy in %u min %u s. Next time, the launcher opens straight to the settings and Play.", "%s foi instalado a partir da sua cópia em %u min %u s. Na próxima abertura, basta clicar em Jogar."},
+    {"%s was built from your copy in %u s. Next time, the launcher opens straight to the settings and Play.", "%s foi instalado a partir da sua cópia em %u s. Na próxima abertura, basta clicar em Jogar."},
+    {"%s is linked to its files at %s again. Nothing was rebuilt, and your saves are where they were.", "%s foi vinculado novamente aos arquivos em %s. Seus saves foram preservados."},
+    {"The builder could not be started (%s).", "Não foi possível iniciar o instalador (%s)."},
+    {"The build finished but the game is not where it should be (%s).", "O processo terminou, mas o jogo não foi encontrado na pasta esperada (%s)."},
+    {"The build stopped (exit %d). Its log is %s/build.log.", "A instalação parou (código %d). O log está em %s/build.log."},
+    {"This release is newer than the game it built for you. Build it again from the same disc to bring it up to date; your saves and settings stay.", "Há uma versão mais recente. Recompile a partir do mesmo disco para atualizar; seus saves e configurações serão preservados."},
+    {"The game is built, but the folder it was built from is no longer where it was. Choose where it is now, or the disc image: the game is linked to it again in a few seconds, with nothing rebuilt. Your saves stay.", "A pasta de origem foi movida. Escolha a nova localização ou a ISO para vincular os arquivos novamente. Seus saves serão preservados."},
+    {"Gamepad", "Controle"},
+    {"Keyboard and mouse", "Teclado e mouse"},
+    {"Gamepad button", "Botão do controle"},
+    {"  (default)", "  (padrão)"},
+    {"Play with other copies over a network. Host: this PC is the session your friends join. Join: play in a friend's session.", "Jogue pela rede. Crie uma sessão neste PC ou entre na sessão de um amigo."},
+    {"What the host gave you, like 81.2.3.4 or a name, with :port if it is not the default.", "Digite o endereço informado pelo anfitrião, com :porta se necessário."},
+    {"Ask the router to forward the port to this PC (UPnP) while you host, so friends on the internet can join. Friends on your own network can join either way.", "Solicita ao roteador o encaminhamento da porta via UPnP para permitir conexões pela internet."},
+    {"Install Turok: Evolution", "Instalar Turok: Evolution"},
+    {"Choose where to install and select your USA (NTSC) disc image. We will extract and prepare the game automatically.", "Escolha onde instalar e selecione a ISO da versão USA (NTSC). Os arquivos serão extraídos e o jogo será preparado automaticamente."},
+    {"1. Installation folder", "1. Onde instalar o jogo"},
+    {"2. Your game ISO", "2. ISO do seu jogo"},
+    {"CHOOSE FOLDER...", "ESCOLHER PASTA..."},
+    {"SELECT ISO...", "SELECIONAR ISO..."},
+    {"No ISO selected", "Nenhuma ISO selecionada"},
+    {"3. Click Install and follow the progress. Your original ISO stays unchanged.", "3. Clique em Instalar e acompanhe o progresso. Sua ISO original não será alterada."},
+    {"Select a folder and an ISO using the buttons above. Esc exits.", "Use os botões acima para escolher a pasta e a ISO. Esc sai."},
+    {"Could not open the file chooser. Please try again.", "Não foi possível abrir a janela de seleção. Tente novamente."},
+    {"No selection made. Use the buttons to choose a folder and an ISO.", "Nada selecionado. Use os botões para escolher a pasta e a ISO."},
+    {"VIDEO", "VÍDEO"},
+    {"INPUT", "CONTROLES"},
+    {"SYSTEM LINK", "REDE"},
+    {"ABOUT", "SOBRE"},
+    {"Graphics card", "Placa de vídeo"},
+    {"Automatic (prefer dedicated GPU)", "Automático (preferir GPU dedicada)"},
+    {"Choose the GPU used when the game starts. Automatic prefers the dedicated graphics card.", "Escolha a GPU usada ao iniciar o jogo. Automático dá preferência à placa dedicada."},
+};
+static const char *tr(const char *text) {
+    size_t i;
+    if (!g_language || !text) return text;
+    for (i = 0; i < sizeof k_translations / sizeof k_translations[0]; i++)
+        if (strcmp(text, k_translations[i].en) == 0) return k_translations[i].pt;
+    return text;
+}
+static void language_path(char *path, size_t n) {
+    char config[1024];
+    path[0] = 0;
+    if (recomp_settings_path(0x41430004, config, sizeof config))
+        snprintf(path, n, "%s.language", config);
+}
+static void language_load(void) {
+    char path[1100], value[16]; FILE *f;
+    language_path(path, sizeof path);
+    f = fopen(path, "rb");
+    if (f) { if (fgets(value, sizeof value, f)) g_language = strncmp(value, "pt-BR", 5) == 0; fclose(f); }
+}
+static void language_save(void) {
+    char path[1100], dir[1100], *slash, *back; FILE *f;
+    language_path(path, sizeof path);
+    if (!path[0]) return;
+    snprintf(dir, sizeof dir, "%s", path);
+    slash = strrchr(dir, '/'); back = strrchr(dir, '\\');
+    if (!slash || (back && back > slash)) slash = back;
+    if (slash) { *slash = 0; recomp_make_dirs(dir); }
+    f = fopen(path, "wb");
+    if (f) { fputs(g_language ? "pt-BR" : "en", f); fclose(f); }
+}
+static int localized_format(char *dst, size_t n, const char *fmt, ...) {
+    int result; va_list args; va_start(args, fmt);
+    result = vsnprintf(dst, n, tr(fmt), args); va_end(args); return result;
+}
+/* Translate only presentation calls; config keys and input bindings remain stable. */
+#define theme_text(r,t,s,w,c,a) theme_text(r,tr(t),s,w,c,a)
+#define theme_text_wrapped(r,t,s,c) theme_text_wrapped(r,tr(t),s,c)
+#define theme_button(r,t,p,l) theme_button(r,tr(t),p,l)
+#define theme_card(r,t) theme_card(r,tr(t))
+#define snprintf localized_format

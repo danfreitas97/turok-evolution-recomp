@@ -40,6 +40,7 @@ enum { LMOUSE_LEFT = 1, LMOUSE_RIGHT, LMOUSE_MIDDLE, LMOUSE_X1, LMOUSE_X2 };
 void        launcher_init(void);
 /* The game's own name, for the window's caption. */
 const char *launcher_title(void);
+int launcher_portuguese(void);
 
 void launcher_key(int key, int shift);  /* a key pressed (repeats too) */
 /* A character typed: printable ASCII, 8 Backspace, 3 copy, 22 paste --

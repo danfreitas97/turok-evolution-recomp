@@ -548,7 +548,8 @@ extern "C" void recomp_audio_output_initialize(void)
             for (uint32_t ins = 1; ins <= 2 && !reverb_voice; ++ins) {
                 IUnknown *apo = nullptr;
                 if (FAILED(XAudio2CreateReverb(&apo, 0))) break;
-                XAUDIO2_EFFECT_DESCRIPTOR effect{apo, TRUE, outs};
+                /* Keep the effect disabled until a valid room is configured. An unconfigured reverb can emit non-finite samples even at zero send volume. */
+                XAUDIO2_EFFECT_DESCRIPTOR effect{apo, FALSE, outs};
                 XAUDIO2_EFFECT_CHAIN chain{1, &effect};
                 XAUDIO2_SEND_DESCRIPTOR d{0, dryTarget()};
                 XAUDIO2_VOICE_SENDS sends{1, &d};
@@ -701,8 +702,10 @@ extern "C" void recomp_audio_output_set_reverb(const RecompI3dl2 *room)
     i3.HFReference = room->hf_reference;
     XAUDIO2FX_REVERB_PARAMETERS native{};
     ReverbConvertI3DL2ToNative(&i3, &native);
-    reverb_voice->SetEffectParameters(0, &native, sizeof native);
-    reverb_voice->SetVolume(1.0f);
+    if (SUCCEEDED(reverb_voice->SetEffectParameters(0, &native, sizeof native))) {
+        reverb_voice->EnableEffect(0);
+        reverb_voice->SetVolume(1.0f);
+    }
 }
 
 extern "C" void recomp_audio_output_clear_mix(uint32_t slot)

@@ -343,6 +343,8 @@ int recomp_settings_read(const char *path, RecompSettings *s)
     {
         const char *v;
 
+        if ((v = from_table("gpu_adapter")) != NULL)
+            snprintf(s->gpu_adapter, sizeof s->gpu_adapter, "%s", v);
         if ((v = from_table("resolution_scale")) != NULL)
             s->resolution_scale = clamp_int(atoi(v), 1, 8);
         if ((v = from_table("widescreen")) != NULL)
@@ -464,6 +466,8 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
     else
         snprintf(reg, sizeof reg, "hor_plus_register = %d", s->hor_plus_register);
 
+    fprintf(f, "# Graphics adapter; empty chooses the dedicated GPU automatically.\n"
+               "gpu_adapter = %s\n\n", s->gpu_adapter);
     fprintf(f,
         "# Settings for this title, written by the launcher and read when the\n"
         "# game starts. Every line can be overridden by the environment\n"

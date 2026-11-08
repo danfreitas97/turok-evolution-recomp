@@ -278,12 +278,16 @@ def macos_runtime(rel, sdk, sdl, cache):
         shutil.copy2(f, rel / folder / f.name)
 
 
-def macos_icon(dst):
+def macos_icon(dst, source=None):
     """The toolkit's icon as an .icns, from its PNGs."""
     iconset = dst.parent / "icon.iconset"
     iconset.mkdir()
     png = ROOT / "assets/icon/png"
     for size in (16, 32, 128, 256, 512):
+        if source:
+            run(["sips", "-z", str(size), str(size), source, "--out", iconset / f"icon_{size}x{size}.png"])
+            run(["sips", "-z", str(size * 2), str(size * 2), source, "--out", iconset / f"icon_{size}x{size}@2x.png"])
+            continue
         shutil.copy2(png / f"{size}.png", iconset / f"icon_{size}x{size}.png")
         if (png / f"{size * 2}.png").is_file():
             shutil.copy2(png / f"{size * 2}.png", iconset / f"icon_{size}x{size}@2x.png")
@@ -521,9 +525,12 @@ def main():
     (rel / "README.txt").write_text(readme)
     # The toolkit's icon, for a desktop entry or a Steam shortcut; on a Mac,
     # the application's.
-    shutil.copy2(ROOT / "assets/icon/png/256.png", rel / "icon.png")
+    title_icon = project / recipe["icon"] if recipe.get("icon") else ROOT / "assets/icon/png/256.png"
+    shutil.copy2(title_icon, rel / "icon.png")
+    if recipe.get("icon_ico"):
+        shutil.copy2(project / recipe["icon_ico"], rel / "icon.ico")
     if MACOS:
-        macos_icon(rel / "icon.icns")
+        macos_icon(rel / "icon.icns", title_icon if recipe.get("icon") else None)
         with open(app / "Contents/Info.plist", "wb") as f:
             plistlib.dump({
                 "CFBundleDevelopmentRegion": "en",

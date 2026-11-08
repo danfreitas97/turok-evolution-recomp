@@ -65,6 +65,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
             ${_dir}/launcher_theme_gdi.c
             ${_dir}/launcher_bindings.c
         )
+        target_link_libraries(${TARGET} PRIVATE dxgi dxguid)
         if(COMMAND xboxrecomp_icon_rc)
             xboxrecomp_icon_rc(_icon_rc)        # cmake/title_icon.cmake
             target_sources(${TARGET} PRIVATE "${_icon_rc}")
@@ -214,7 +215,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
     endif()
     if(MSVC)
         target_compile_options(${TARGET} PRIVATE
-            /W4 $<$<NOT:$<CONFIG:Debug>>:/O2>)
+            /utf-8 /W4 $<$<NOT:$<CONFIG:Debug>>:/O2>)
     else()
         target_compile_options(${TARGET} PRIVATE
             -Wall -Wextra -Wno-unused-parameter $<$<NOT:$<CONFIG:Debug>>:-O2>)

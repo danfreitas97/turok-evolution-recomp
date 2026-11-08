@@ -36,10 +36,19 @@ Download the file for your system from the
 | macOS | `turok-<version>-macos-arm64.tar.xz` | Unpack it, then see [macOS](#macos) below |
 | Linux, SteamOS | `turok-<version>-linux-x86_64.tar.xz` | Unpack it and run `./turok` |
 
-The first time it starts, it asks for your copy of the game: choose **Disc
-image...** or **Folder...**, or paste a path. It then builds the game, which
-takes a few minutes (longer on a Steam Deck), and opens the settings. Press
-**Play**. After that it opens straight to the settings.
+The first time it starts, choose your installation folder with **Choose folder...**,
+then select your own **Select ISO...** (ISO/XISO).
+Review both paths and press **Install**. Extraction, disc validation and
+compilation run automatically, with a progress bar and live log. The full log
+is saved as `build.log` inside the chosen installation folder. Once finished,
+press **OK**, then **Play**. Later starts remember the installation.
+
+Choose **English** or **PT-BR** using the flags at the top of the installer
+and launcher. The selection is remembered; technical logs remain verbatim.
+
+Use an empty destination folder. Updates and retries can reuse the existing
+installation; saves are preserved. Keep the downloaded launcher package: it
+contains the tools needed for updates.
 
 **Windows** may say it protected your PC, because the release is not signed:
 choose More info, then Run anyway.
@@ -120,7 +129,8 @@ at thousands; a cap saves power, which matters on a handheld.
 
 ## Where things are kept
 
-The built game, its saves and the logs are in one folder per user:
+The built game, its saves and logs are in the installation folder you choose.
+The default locations are:
 
 | | |
 | --- | --- |
@@ -343,3 +353,7 @@ game code or assets.
 
 The code in this repository is licensed under the GNU General Public License
 v3.0; see [LICENSE](LICENSE). That covers the files committed here, not the game.
+
+On Windows, **Video → Graphics card** selects the adapter. Automatic prefers
+the GPU with more dedicated video memory. The selected card is recorded in
+the game log. The build includes `turok.ico` for shortcuts.

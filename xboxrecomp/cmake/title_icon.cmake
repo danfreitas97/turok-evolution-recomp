@@ -28,6 +28,7 @@ function(xboxrecomp_icon_rc OUT)
     if(NOT _old STREQUAL _text)
         file(WRITE "${_rc}" "${_text}")
     endif()
+    set_source_files_properties("${_rc}" PROPERTIES OBJECT_DEPENDS "${_ico}")
     set(${OUT} "${_rc}" PARENT_SCOPE)
 endfunction()
 

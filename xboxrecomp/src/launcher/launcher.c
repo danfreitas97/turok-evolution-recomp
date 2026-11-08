@@ -24,6 +24,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#define COBJMACROS
 #include <windows.h>        /* game_intact: a release's junctions */
 #define strcasecmp _stricmp
 #else
@@ -43,6 +44,10 @@
 #include "recomp_pad.h"
 #include "net_upnp.h"
 #include "platform/host_main.h"
+#include "launcher_i18n.inc"
+#ifdef _WIN32
+#include "platform/gpu_select_win32.h"
+#endif
 
 #ifndef LAUNCHER_GAME_EXE
 #define LAUNCHER_GAME_EXE "game.exe"
@@ -107,6 +112,33 @@ static const char *const *k_frame_caps = k_frame_caps_console;
 static RecompSettings g_settings;
 static int            g_frame_cap_index;   /* into k_frame_caps */
 static int            g_widescreen;        /* the row; settings_save applies it */
+
+static int g_gpu_index;
+static char g_gpu_names[16][256];
+static const char *g_gpu_choices[18];
+static void gpu_choices_load(void)
+{
+    int count = 0;
+    g_gpu_index = 0;
+    memset(g_gpu_choices, 0, sizeof g_gpu_choices);
+    g_gpu_choices[0] = "Automatic (prefer dedicated GPU)";
+#ifdef _WIN32
+    {
+        IDXGIFactory *factory = NULL; IDXGIAdapter *adapter = NULL; UINT i;
+        if (SUCCEEDED(CreateDXGIFactory(&IID_IDXGIFactory, (void **)&factory))) {
+            for (i = 0; count < 16 && IDXGIFactory_EnumAdapters(factory, i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+                if (turok_gpu_name(adapter, g_gpu_names[count], sizeof g_gpu_names[count], NULL)) {
+                    g_gpu_choices[count + 1] = g_gpu_names[count];
+                    if (strcmp(g_settings.gpu_adapter, g_gpu_names[count]) == 0) g_gpu_index = count + 1;
+                    count++;
+                }
+                IDXGIAdapter_Release(adapter);
+            }
+            IDXGIFactory_Release(factory);
+        }
+    }
+#endif
+}
 
 static Row  g_video_rows[12];
 static int  g_video_count;
@@ -176,6 +208,12 @@ static const char *frame_cap_label(int i)
 static void build_rows(void)
 {
     Row *r = g_video_rows;
+#ifdef _WIN32
+    r->label = "Graphics card";
+    r->help = "Choose the GPU used when the game starts. Automatic prefers the dedicated graphics card.";
+    r->kind = ROW_CHOICE; r->choices = g_gpu_choices; r->ival = &g_gpu_index;
+    r++;
+#endif
 
     r->label = "Resolution";
     r->help  = "Render larger than the console, then filter back down. Costs little.";
@@ -375,7 +413,9 @@ static void row_value(const Row *r, char *out, size_t n)
             snprintf(out, n, "%dx", *r->ival);
         break;
     case ROW_CHOICE:
-        if (r->ival == &g_link_mode)
+        if (r->ival == &g_gpu_index)
+            snprintf(out, n, "%s", g_gpu_choices[g_gpu_index]);
+        else if (r->ival == &g_link_mode)
             snprintf(out, n, "%s", link_mode_label(*r->ival));
         else
             snprintf(out, n, "%s", frame_cap_label(*r->ival));
@@ -485,6 +525,9 @@ static double g_build_progress;
 static char   g_build_label[96], g_build_detail[200];
 static int    g_build_cancelled;
 static uint64_t g_build_started, g_build_ms; /* lhost_ticks; how long it took */
+static int    g_pick_install;
+static char   g_build_log[12][512];
+static int    g_build_log_count;
 static int    g_setup_sel;              /* 0 the path, 1 image, 2 folder, 3 build */
 
 static int read_small_file(const char *path, char *buf, size_t n)
@@ -769,6 +812,14 @@ static void release_init(void)
         snprintf(g_rel_error, sizeof g_rel_error,
                  "There is no home folder to build the game in (HOME is not set).");
         return;
+    }
+    {
+        char location[LAUNCHER_PATH + 40], saved[LAUNCHER_PATH];
+        snprintf(location, sizeof location, "%s/install-location.txt", g_user_dir);
+        if (read_small_file(location, saved, sizeof saved) && saved[0]) {
+            saved[strcspn(saved, "\r\n")] = 0;
+            snprintf(g_user_dir, sizeof g_user_dir, "%s", saved);
+        }
     }
     release_status();
 #if defined(__APPLE__)
@@ -1057,6 +1108,7 @@ static void settings_load(void)
     if (recomp_settings_path(g_title_id, path, sizeof path))
         recomp_settings_read(path, &g_settings);
 
+    gpu_choices_load();
     g_widescreen = g_settings.widescreen;
     k_frame_caps = recomp_title_keeps_time() ? k_frame_caps_time : k_frame_caps_console;
     g_frame_cap_index = 0;
@@ -1121,6 +1173,8 @@ static int settings_save(void)
      * survives every Play. */
     recomp_settings_set_widescreen(&g_settings, g_widescreen);
 #endif
+    snprintf(g_settings.gpu_adapter, sizeof g_settings.gpu_adapter, "%s",
+             g_gpu_index ? g_gpu_choices[g_gpu_index] : "");
     snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
              k_frame_caps[g_frame_cap_index]);
     if (g_link_mode != LINK_BY_HAND)
@@ -1324,7 +1378,7 @@ static ThemeRect row_rect(int i)
 {
     ThemeRect r;
     r.x = 60;
-    r.y = 168 + i * 62;
+    r.y = 168 + i * (g_tab == TAB_VIDEO ? 56 : 62);
     r.w = g_cw - 120;
     r.h = 52;
     return r;
@@ -1582,7 +1636,7 @@ static int draw_rows(const Row *rows, int count, int wrap_help)
             theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
     }
 
-    r.x = 62; r.y = 168 + count * 62 + 10;
+    r.x = 62; r.y = 168 + count * (g_tab == TAB_VIDEO ? 56 : 62) + 10;
     r.w = g_cw - 124; r.h = 46;
     if (g_sel < count) {
         if (wrap_help)
@@ -1673,16 +1727,11 @@ static int hit_play(int mx, int my);
 /* The path box and the three buttons under it. */
 static ThemeRect setup_rect(int i)
 {
-    ThemeRect r;
-
-    if (i == 0) {
-        r.x = 60; r.y = 270; r.w = g_cw - 120; r.h = 52;
-        return r;
-    }
-    r.w = (g_cw - 120 - 2 * 20) / 3;
-    r.h = 46;
-    r.y = 342;
-    r.x = 60 + (i - 1) * (r.w + 20);
+    ThemeRect r = {60, 400, g_cw - 330, 52};
+    if (i == 4 || i == 5) r.y = 280;
+    if (i == 1 || i == 5 || i == 3) { r.x = g_cw - 250; r.w = 190; }
+    if (i == 3) { r.y = 500; r.h = 56; }
+    if (i == 2) { r.x = -1000; r.y = -1000; r.w = r.h = 0; }
     return r;
 }
 
@@ -1694,7 +1743,7 @@ static int in_rect(ThemeRect r, int mx, int my)
 static void release_start_build(void)
 {
     char exe[LAUNCHER_PATH + 64];
-    const char *argv[5];
+    const char *argv[7];
 
     if (!g_source[0]) {
         snprintf(g_rel_note, sizeof g_rel_note,
@@ -1713,7 +1762,9 @@ static void release_start_build(void)
     g_rel_relinking = g_rel_moved;
     argv[0] = exe; argv[1] = g_rel_relinking ? "relink" : "build";
     argv[2] = "--source"; argv[3] = g_source;
-    argv[4] = NULL;
+    argv[4] = "--install-dir"; argv[5] = g_user_dir; argv[6] = NULL;
+    if (g_rel_relinking) argv[4] = NULL;
+    g_build_log_count = 0;
     g_rel_error[0] = g_rel_note[0] = '\0';
     g_rel_unsupported = g_build_cancelled = 0;
     g_build_progress = 0.0;
@@ -1740,6 +1791,12 @@ static void release_line(const char *line)
         json_str(line, "label", g_build_label, sizeof g_build_label);
         if (!json_str(line, "detail", g_build_detail, sizeof g_build_detail))
             g_build_detail[0] = '\0';
+    } else if (strcmp(ev, "log") == 0) {
+        if (g_build_log_count == 12) {
+            memmove(g_build_log, g_build_log + 1, 11 * sizeof g_build_log[0]);
+            g_build_log_count--;
+        }
+        json_str(line, "message", g_build_log[g_build_log_count++], sizeof g_build_log[0]);
     } else if (strcmp(ev, "error") == 0) {
         json_str(line, "message", g_rel_error, sizeof g_rel_error);
         g_rel_unsupported = strstr(line, "\"unsupported\":true") != NULL;
@@ -1756,6 +1813,7 @@ static void release_tick(void)
 
     while (n++ < 64 && lhost_job_line(line, sizeof line))
         release_line(line);
+    if (n > 64) return; /* Drain queued log/error events before accepting the exit code. */
     code = lhost_job_status();
     if (code < 0)
         return;
@@ -1794,72 +1852,39 @@ static void release_tick(void)
 
 static void draw_setup(void)
 {
-    ThemeRect p, r;
-    int i;
-
-    p.x = 60; p.y = 104; p.w = g_cw - 120; p.h = 140;
+    ThemeRect p = {60, 104, g_cw - 120, 112}, r;
     theme_panel(p, 0.2);
-    r.x = p.x + 24; r.y = p.y + 18; r.w = p.w - 48; r.h = 26;
-    theme_text(r, g_rel_moved ? "The game's files have moved"
-                  : g_rel_stale ? "Build the game again" : "Your copy of the game",
-               15, 700, THEME_TEXT, THEME_LEFT);
-    r.y += 36; r.h = 80;
-    theme_text_wrapped(r, g_rel_moved
-        ? "The game is built, but the folder it was built from is no longer where "
-          "it was. Choose where it is now, or the disc image: the game is linked to "
-          "it again in a few seconds, with nothing rebuilt. Your saves stay."
-        : g_rel_stale
-        ? "This release is newer than the game it built for you. Build it again "
-          "from the same disc to bring it up to date; your saves and settings stay."
-        : "Choose your disc image (.iso) or the folder the game's files are in. "
-          "The game is built from it once, here on this computer, which takes a "
-          "minute or two. An image is extracted to your home folder; a folder is "
-          "linked, never copied or changed.", 12, THEME_TEXT_DIM);
+    r = p; r.x += 24; r.y += 16; r.w -= 48; r.h = 26;
+    theme_text(r, "Install Turok: Evolution", 16, 700, THEME_TEXT, THEME_LEFT);
+    r.y += 38; r.h = 48;
+    theme_text_wrapped(r, "Choose where to install and select your USA (NTSC) disc image. We will extract and prepare the game automatically.", 12, THEME_TEXT_DIM);
 
-    r = setup_rect(0);
-    theme_panel(r, g_setup_sel == 0 ? 0.8 : 0.25);
-    r.x += 18; r.w -= 36;
-    if (g_source[0]) {
-        char shown[LAUNCHER_PATH + 4];
+    r.x = 60; r.y = 246; r.w = g_cw - 120; r.h = 26;
+    theme_text(r, "1. Installation folder", 13, 700, THEME_GREEN, THEME_LEFT);
+    r = setup_rect(4); theme_panel(r, g_setup_sel == 4 ? 0.8 : 0.25);
+    r.x += 14; r.w -= 28;
+    theme_text(r, g_user_dir, 11, 400, THEME_TEXT, THEME_LEFT);
+    theme_button(setup_rect(5), "CHOOSE FOLDER...", 0, g_setup_sel == 5 ? 1 : 0);
 
-        snprintf(shown, sizeof shown, "%s%s", g_source,
-                 g_setup_sel == 0 && ((int)(g_pulse * 4) & 1) ? "_" : "");
-        theme_text(r, shown, 12, 400, THEME_TEXT, THEME_LEFT);
-    } else {
-        theme_text(r, "Type or paste a path, or choose one below", 12, 400,
-                   THEME_TEXT_DIM, THEME_LEFT);
-    }
-    for (i = 1; i <= 3; i++) {
-        static const char *const k_labels[] = { "", "DISC IMAGE...", "FOLDER...", "BUILD" };
-        const char *label = (i == 3 && g_rel_moved) ? "LINK AGAIN"
-                          : (i == 3 && g_rel_stale) ? "BUILD AGAIN" : k_labels[i];
+    r.x = 60; r.y = 366; r.w = g_cw - 120; r.h = 26;
+    theme_text(r, "2. Your game ISO", 13, 700, THEME_GREEN, THEME_LEFT);
+    r = setup_rect(0); theme_panel(r, g_setup_sel == 0 ? 0.8 : 0.25);
+    r.x += 14; r.w -= 28;
+    theme_text(r, g_source[0] ? g_source : "No ISO selected", 11, 400,
+               g_source[0] ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+    theme_button(setup_rect(1), "SELECT ISO...", 0, g_setup_sel == 1 ? 1 : 0);
 
-        r = setup_rect(i);
-        theme_panel(r, g_setup_sel == i ? 0.9 : 0.3);
-        theme_text(r, label, 12, 700,
-                   (i == 3 && !g_source[0]) ? THEME_TEXT_DIM : THEME_TEXT, THEME_CENTRE);
-    }
-
-    r.x = 60; r.y = 416; r.w = g_cw - 120; r.h = 290;
+    r.x = 60; r.y = 500; r.w = g_cw - 350; r.h = 56;
+    theme_text_wrapped(r, "3. Click Install and follow the progress. Your original ISO stays unchanged.", 12, THEME_TEXT_DIM);
+    theme_button(setup_rect(3), g_rel_stale ? "BUILD AGAIN" : g_rel_moved ? "LINK AGAIN" : "INSTALL", g_source[0] != 0, g_setup_sel == 3 ? 1 : 0);
+    r.x = 60; r.y = 586; r.w = g_cw - 120; r.h = g_ch - 660;
     if (g_rel_error[0]) {
-        theme_panel(r, 0.15);
-        r.x += 24; r.y += 16; r.w -= 48; r.h = 24;
-        theme_text(r, g_rel_unsupported ? "This disc can't be used"
-                      : g_rel_relinking ? "The game's files were not linked"
-                      : "The build did not finish",
-                   13, 700, THEME_GREEN, THEME_LEFT);
-        r.y += 30; r.h = 230;
+        theme_panel(r, .2);
+        r.x += 16; r.y += 10; r.w -= 32; r.h -= 20;
         theme_text_wrapped(r, g_rel_error, 11, THEME_TEXT);
-    } else if (g_rel_note[0]) {
-        r.h = 40;
-        theme_text_wrapped(r, g_rel_note, 12, THEME_TEXT_DIM);
-    }
-
+    } else if (g_rel_note[0]) theme_text_wrapped(r, g_rel_note, 12, THEME_TEXT_DIM);
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 120; r.h = 24;
-    theme_text(r, g_pad_seen
-                  ? "A  Choose      B  Quit      D-pad  Move"
-                  : "Enter  Choose      Esc  Quit      Type or paste a path in the box",
-               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    theme_text(r, "Select a folder and an ISO using the buttons above. Esc exits.", 11, 400, THEME_TEXT_DIM, THEME_LEFT);
 }
 
 static void draw_building(void)
@@ -1886,6 +1911,20 @@ static void draw_building(void)
                           : "This happens once. Later starts go straight to the game. "
                             "It is building from your own copy, on this computer.",
                        11, THEME_TEXT_DIM);
+
+    p.x = 60; p.y = 450; p.w = g_cw - 120; p.h = g_ch - 550;
+    theme_panel(p, 0.2);
+    r.x = p.x + 16; r.y = p.y + 8; r.w = p.w - 32; r.h = 20;
+    theme_text(r, "LIVE LOG  -  full details in build.log", 11, 700, THEME_GREEN, THEME_LEFT);
+    {
+        int rows = (p.h - 36) / 17, first, i;
+        if (rows > 12) rows = 12;
+        first = g_build_log_count > rows ? g_build_log_count - rows : 0;
+        for (i = first; i < g_build_log_count; i++) {
+            r.y += 17;
+            theme_text(r, g_build_log[i], 10, 400, THEME_TEXT_DIM, THEME_LEFT);
+        }
+    }
 
     r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
     theme_text(r, g_pad_seen ? "B  Cancel" : "Esc  Cancel", 11, 400,
@@ -1942,11 +1981,12 @@ static void done_ok(void)
 
 static void setup_activate(int i)
 {
-    if (i == 1 || i == 2) {
-        if (!lhost_pick(i == 2))
+    if (i == 0 || i == 1 || i == 4 || i == 5) {
+        g_pick_install = i == 4 || i == 5;
+        if (!lhost_pick(g_pick_install))
             snprintf(g_rel_note, sizeof g_rel_note,
-                     "No file dialog here: type or paste the path in the box.");
-    } else {
+                     "Could not open the file chooser. Please try again.");
+    } else if (i == 3) {
         release_start_build();
     }
 }
@@ -1965,12 +2005,13 @@ static void setup_nav(int dx, int dy, int accept, int cancel)
         }
         return;
     }
-    if (dy < 0) g_setup_sel = 0;
-    if (dy > 0 && g_setup_sel == 0) g_setup_sel = 1;
-    if (dx && g_setup_sel > 0) {
-        g_setup_sel += dx;
-        if (g_setup_sel < 1) g_setup_sel = 1;
-        if (g_setup_sel > 3) g_setup_sel = 3;
+    if (dx || dy) {
+        static const int order[] = {5, 1, 3};
+        int at = g_setup_sel == 5 ? 0 : g_setup_sel == 3 ? 2 : 1;
+        at += dx ? dx : dy;
+        if (at < 0) at = 0;
+        if (at > 2) at = 2;
+        g_setup_sel = order[at];
     }
     if (accept)
         setup_activate(g_setup_sel);
@@ -1994,46 +2035,35 @@ static void setup_click(int mx, int my)
         }
         return;
     }
-    for (i = 0; i <= 3; i++)
+    for (i = 0; i <= 5; i++)
         if (in_rect(setup_rect(i), mx, my)) {
             g_setup_sel = i;
-            if (i)
-                setup_activate(i);
+            setup_activate(i);
         }
 }
 
 static void setup_char(unsigned ch)
 {
-    size_t n = strlen(g_source);
-
-    if (g_rel != REL_SETUP)
-        return;
-    if (ch == 22) {
-        char paste[LAUNCHER_PATH];
-
-        if (lhost_paste(paste, sizeof paste))
-            snprintf(g_source, sizeof g_source, "%s", paste);
-    } else if (ch == 8) {
-        if (n) g_source[n - 1] = '\0';
-    } else if (ch >= 32 && ch < 127 && n + 1 < sizeof g_source) {
-        g_source[n] = (char)ch;
-        g_source[n + 1] = '\0';
-    } else {
-        return;
-    }
-    g_setup_sel = 0;
-    g_rel_note[0] = '\0';
+    (void)ch; /* Paths are selected with native dialogs, not edited here. */
 }
 
 void launcher_picked(const char *path)
 {
     if (!path) {
         snprintf(g_rel_note, sizeof g_rel_note,
-                 "Nothing chosen. If no dialog appeared, type or paste the path in the box.");
+                 "No selection made. Use the buttons to choose a folder and an ISO.");
         return;
     }
-    snprintf(g_source, sizeof g_source, "%s", path);
-    release_start_build();
+    if (g_pick_install) {
+        if (g_rel_moved || g_rel_stale) {
+            snprintf(g_rel_note, sizeof g_rel_note, "Keep the existing installation folder when updating or repairing.");
+            return;
+        }
+        snprintf(g_user_dir, sizeof g_user_dir, "%s", path);
+    } else {
+        snprintf(g_source, sizeof g_source, "%s", path);
+    }
+    g_rel_note[0] = 0;
 }
 
 /* ------------------------------------------------------------------ home
@@ -2139,7 +2169,7 @@ static void draw_home(void)
     w = g_cw - x - 36;
 
     /* The game: ready or not, and how it is set to run. */
-    r.x = x; r.y = 56; r.w = w; r.h = 158;
+    r.x = x; r.y = 82; r.w = w; r.h = 132;
     c = theme_card(r, "GAME");
     theme_dot(c.x + 6, c.y + 11, 5, game_ready() ? RGB(0x5C, 0xE0, 0x7A) : RGB(0xE0, 0xA0, 0x40));
     r = c; r.x += 20; r.w -= 20; r.h = 22;
@@ -2521,6 +2551,7 @@ void launcher_init(void)
 {
     const char *build;
 
+    language_load();
     release_init();
     read_title();
 #ifdef LAUNCHER_HAS_BRAND
@@ -2576,9 +2607,24 @@ int launcher_mouse_button(int button)
     return capture_mouse(button);
 }
 
+static ThemeRect language_rect(int language) {
+    ThemeRect r = {g_cw - 300 + language * 120, 34, 112, 36};
+    return r;
+}
+
+int launcher_portuguese(void) { return g_language; }
+
 void launcher_draw(void)
 {
+    int i;
     draw();
+    for (i = 0; i < 2; i++) {
+        ThemeRect r = language_rect(i), flag = {r.x + 8, r.y + 9, 28, 18};
+        theme_panel(r, g_language == i ? 0.95 : 0.3);
+        theme_flag(flag, i);
+        r.x += 42; r.w -= 46;
+        theme_text(r, i ? "PT-BR" : "English", 10, 700, THEME_TEXT, THEME_LEFT);
+    }
 }
 
 void launcher_key(int key, int shift)
@@ -2622,6 +2668,13 @@ void launcher_char(unsigned ch)
 void launcher_click(int mx, int my)
 {
     int i;
+    for (i = 0; i < 2; i++) {
+        if (in_rect(language_rect(i), mx, my)) {
+            g_language = i;
+            language_save();
+            return;
+        }
+    }
 
     if (g_release && g_rel != REL_READY) {
         setup_click(mx, my);

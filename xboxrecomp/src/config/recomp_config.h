@@ -224,6 +224,7 @@ void recomp_window_fit(int max_w, int max_h, int *w, int *h);
  * through the lookups above -- that keeps the environment override
  * visible where each setting is used -- but the file's shape is here. */
 typedef struct RecompSettings {
+    char gpu_adapter[256];     /* DXGI description; empty selects dedicated GPU automatically */
     int  resolution_scale;      /* 1..8 */
     int  widescreen;            /* 0 or 1: the one switch; see RecompWidescreen */
     double hor_plus;            /* RECOMP_HOR_PLUS_AUTO, or an override: 0 leaves

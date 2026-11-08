@@ -36,10 +36,17 @@ Baixe o arquivo do seu sistema no
 | macOS | `turok-<versão>-macos-arm64.tar.xz` | Descompacte e veja [macOS](#macos) abaixo |
 | Linux, SteamOS | `turok-<versão>-linux-x86_64.tar.xz` | Descompacte e rode `./turok` |
 
-Na primeira vez, ele pede a sua cópia do jogo: escolha **Disc image...** ou
-**Folder...**, ou cole um caminho. Depois ele compila o jogo, o que leva alguns
-minutos (mais num Steam Deck), e abre as configurações. Clique em **Play**. Das
-próximas vezes ele abre direto nas configurações.
+Na primeira abertura, escolha uma pasta de instalação vazia em **Escolher pasta...**
+e a sua ISO/XISO em **Selecionar ISO...**.
+Confira os caminhos e clique em **Instalar**. O instalador extrai, verifica e
+compila automaticamente, mostrando barra de progresso e log ao vivo.
+O log completo fica em `build.log` na pasta escolhida. Ao terminar, clique em
+**OK** e **Jogar**. O launcher lembra o destino nas próximas aberturas.
+Atualizações e novas tentativas podem usar a instalação existente, preservando
+os saves. Mantenha o pacote do launcher para futuras atualizações.
+
+Escolha **English** ou **PT-BR** pelas bandeiras no topo do instalador e do
+launcher. A preferência é salva; os logs técnicos mantêm a saída original.
 
 O **Windows** pode dizer que protegeu o seu PC, porque o release não é
 assinado: clique em Mais informações e depois em Executar assim mesmo.
@@ -347,3 +354,7 @@ xboxrecomp não contêm código nem arquivos do jogo.
 
 O código deste repositório é licenciado sob a GNU General Public License v3.0;
 veja [LICENSE](LICENSE). Isso cobre os arquivos versionados aqui, não o jogo.
+
+No Windows, **Vídeo → Placa de vídeo** permite escolher a GPU. Automático
+prioriza a placa com mais memória de vídeo dedicada. O log registra a GPU
+usada. O build inclui `turok.ico` para atalhos.

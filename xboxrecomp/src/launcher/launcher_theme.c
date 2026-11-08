@@ -341,3 +341,32 @@ void theme_arrows(ThemeRect r, int can_left, int can_right, double lit)
 
 /* A title's own artwork: launcher_theme_brand.inc. */
 #include "launcher_theme_brand.inc"
+
+/* Small vector flags: no emoji font or external image is required. */
+void theme_flag(ThemeRect r, int brazil)
+{
+    int px, py;
+    for (py = (int)(r.y * theme_scale); py < (int)((r.y + r.h) * theme_scale); py++) {
+        for (px = (int)(r.x * theme_scale); px < (int)((r.x + r.w) * theme_scale); px++) {
+            double x = (px / theme_scale - r.x) / r.w;
+            double y = (py / theme_scale - r.y) / r.h;
+            unsigned colour;
+            if (px < 0 || py < 0 || px >= theme_w || py >= theme_h) continue;
+            if (brazil) {
+                colour = 0x009B3A;
+                if (fabs(x - 0.5) / 0.43 + fabs(y - 0.5) / 0.43 < 1) colour = 0xFFDF00;
+                if ((x-.5)*(x-.5)*2.42 + (y-.5)*(y-.5) < .046) {
+                    colour = 0x002776;
+                    if (fabs(y - (.43 + .16*x)) < .035) colour = 0xFFFFFF;
+                }
+            } else {
+                colour = ((int)(y * 13) & 1) ? 0xFFFFFF : 0xB22234;
+                if (x < .43 && y < .54) {
+                    colour = 0x3C3B6E;
+                    if (fmod(x, .075) < .018 && fmod(y, .10) < .03) colour = 0xFFFFFF;
+                }
+            }
+            theme_px[py * theme_w + px] = colour;
+        }
+    }
+}

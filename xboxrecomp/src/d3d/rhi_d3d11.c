@@ -21,6 +21,8 @@
 #include "rhi_backend.h"
 #include "rhi_shader_cache.h"
 #include "d3d8_internal.h"
+#include "recomp_config.h"
+#include "platform/gpu_select_win32.h"
 
 /* ---- the numbering the RHI borrows ------------------------------------------ */
 
@@ -279,7 +281,14 @@ static int  g_vrr;          /* rhi_swapchain_set_vrr */
 static HRESULT create_device_and_swap(DXGI_SWAP_CHAIN_DESC *scd, UINT *create_flags,
                                       D3D_FEATURE_LEVEL *feature_level)
 {
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+    const char *requested = recomp_config_lookup("RECOMP_GPU_ADAPTER", "gpu_adapter");
+    int matched;
+    IDXGIAdapter *selected = turok_gpu_select(requested, &matched);
+    D3D_DRIVER_TYPE driver = selected ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+    HRESULT hr;
+    if (requested && *requested && !matched)
+        fprintf(stderr, "[RHI] Requested GPU unavailable: %s; using automatic selection\n", requested);
+    hr = D3D11CreateDeviceAndSwapChain(selected, driver, NULL,
                                                *create_flags, NULL, 0, D3D11_SDK_VERSION,
                                                scd, &g_swap, &g_dev, feature_level, &g_ctx);
 
@@ -288,9 +297,32 @@ static HRESULT create_device_and_swap(DXGI_SWAP_CHAIN_DESC *scd, UINT *create_fl
     if (FAILED(hr) && (*create_flags & D3D11_CREATE_DEVICE_DEBUG)) {
         fprintf(stderr, "D3D8: D3D11 debug layer unavailable (0x%08lX), creating without it\n", hr);
         *create_flags &= ~(UINT)D3D11_CREATE_DEVICE_DEBUG;
-        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+        hr = D3D11CreateDeviceAndSwapChain(selected, driver, NULL,
                                            *create_flags, NULL, 0, D3D11_SDK_VERSION,
                                            scd, &g_swap, &g_dev, feature_level, &g_ctx);
+    }
+    if (FAILED(hr) && selected) {
+        fprintf(stderr, "[RHI] Selected GPU failed (0x%08lX); retrying the system hardware adapter\n", hr);
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                *create_flags, NULL, 0, D3D11_SDK_VERSION, scd, &g_swap, &g_dev, feature_level, &g_ctx);
+    }
+    if (selected) IDXGIAdapter_Release(selected);
+    if (SUCCEEDED(hr)) {
+        IDXGIDevice *dxgi = NULL;
+        IDXGIAdapter *adapter = NULL;
+        DXGI_ADAPTER_DESC desc;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(g_dev, &IID_IDXGIDevice, (void **)&dxgi))) {
+            if (SUCCEEDED(IDXGIDevice_GetAdapter(dxgi, &adapter))) {
+                if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &desc))) {
+                    char name[256];
+                    WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof name, NULL, NULL);
+                    fprintf(stderr, "[RHI] GPU: %s (hardware D3D11, %llu MB dedicated VRAM)\n",
+                            name, (unsigned long long)(desc.DedicatedVideoMemory / (1024 * 1024)));
+                }
+                IDXGIAdapter_Release(adapter);
+            }
+            IDXGIDevice_Release(dxgi);
+        }
     }
     return hr;
 }

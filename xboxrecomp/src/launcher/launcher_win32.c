@@ -367,11 +367,11 @@ int lhost_pick(int folder)
     opts |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
     if (folder) {
         opts |= FOS_PICKFOLDERS;
-        IFileOpenDialog_SetTitle(dlg, L"The folder the game's files are in");
+        IFileOpenDialog_SetTitle(dlg, launcher_portuguese() ? L"Escolha onde instalar o jogo" : L"Choose the installation folder");
     } else {
         opts |= FOS_FILEMUSTEXIST;
         IFileOpenDialog_SetFileTypes(dlg, 2, k_images);
-        IFileOpenDialog_SetTitle(dlg, L"The game's disc image");
+        IFileOpenDialog_SetTitle(dlg, launcher_portuguese() ? L"Selecione a ISO do seu jogo" : L"Select your game ISO");
     }
     IFileOpenDialog_SetOptions(dlg, opts);
     if (SUCCEEDED(IFileOpenDialog_Show(dlg, g_hwnd)) &&
