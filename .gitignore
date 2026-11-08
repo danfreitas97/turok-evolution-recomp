@@ -1,0 +1,41 @@
+# ---- NEVER commit game data: bring your own disc ----
+*.iso
+*.xiso
+*.xbe
+*.xmv
+*.tre
+*.7z
+*.zip
+*.rar
+/game
+/game/
+extracted/
+src/recomp/gen/*
+!src/recomp/gen/.gitkeep
+
+# ---- build output ----
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.map
+
+# ---- runtime logs / captures ----
+logs/
+*.log
+*.bmp
+*.ppm
+
+# ---- editors / OS / python ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
