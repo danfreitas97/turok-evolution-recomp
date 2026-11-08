@@ -1,8 +1,8 @@
 /**
- * Turok: Evolution (Xbox, USA) - Recompiled Game Entry Point
+ * Turok: Evolution - Recompiled Game Entry Point
  *
- * This is the Windows executable that hosts the recompiled game code.
- * It performs the following initialization sequence:
+ * This is the executable that hosts the recompiled game code, on Windows,
+ * macOS and Linux. It performs the following initialization sequence:
  *
  * 1. Load the original XBE file from disk
  * 2. Initialize the Xbox memory layout (map data sections to original VAs)
@@ -10,34 +10,49 @@
  * 4. Initialize the kernel bridge (thunk table in Xbox memory)
  * 5. Set up game file paths for I/O redirection
  * 6. Initialize the stack pointer
- * 7. Install VEH crash handler for diagnostics
+ * 7. Install the fault handler (a VEH on Windows, signals on POSIX)
  * 8. Call the game's original entry point (recompiled)
  *
  * Customize this file for your game:
- * The game directory is ./game by default, or TUROK_GAME_DIR.
+ *   - Set YOUR_GAME_ENTRY_POINT to the XBE entry point address
+ *   - Set YOUR_GAME_XBE_PATH to where the XBE file lives
+ *   - Set YOUR_GAME_DIR to the game data directory
  *   - Add any CRT global pre-initialization your game needs
- *   - Customize the VEH handler for game-specific crash diagnosis
+ *   - Customize the crash report (title_crash) for game-specific diagnosis
  *
- * XBE Details (from tools.xbe_parser):
- *   Title:       Turok Evolution
- *   Title ID:    0x41430004 (Acclaim), XDK 1.0.4627, built 2002-08-09
+ * What is not portable C -- where the executable is, where the output goes,
+ * message boxes, symbol names, the fault handler, and on POSIX which thread
+ * the title runs on -- is in the runtime (src/platform/host_main.h,
+ * src/platform/recomp_fault.h), not here.
+ *
+ * XBE Details (fill in from xbe_parser output):
+ *   Title:       Turok: Evolution
+ *   Title ID:    0x41430004
  *   Base addr:   0x00010000
  *   Entry point: 0x0001106F
- *   Code size:   ~1.5 MB (.text 0x181470)
- *   Sections:    .text D3D D3DX XGRPH DSOUND XMV XPP .rdata .data DOLBY $$XTIMAGE
- *   Kernel imports: 104
+ *   Code size:   ~??? KB (.text)
+ *   Sections:    ?? (list them)
+ *   Kernel imports: ??
  */
 
-#include <windows.h>
-#include <dbghelp.h>
+#include "platform/xbox_winnt.h"     /* <windows.h> on Windows, the NT types elsewhere */
+#include "platform/host_main.h"
+#include "platform/recomp_fault.h"
+#ifndef _WIN32
+#include "host.h"                     /* src/host: the main-thread loop */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>            /* malloc_zone_pressure_relief */
+#endif
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "xbox_watchpoint.h"
+#include "xbox_fault_route.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -52,80 +67,181 @@
 
 /* ── Global register state (defined in xbox_memory_layout.c) ── */
 
-/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
- * a plain `extern` referencing a __declspec(thread) variable does not resolve
- * to the calling thread's copy -- it resolves to the image's TLS template. The
- * host side then writes g_esp somewhere the generated code never reads, so the
- * guest starts with every register at zero and faults immediately, having
- * apparently ignored the setup that visibly ran. */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
-extern RECOMP_TLS uint32_t g_seh_ebp;
-/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
- * guest routine can lift to several C functions, so a value written in one
- * body is read in the next. Defined in xbox_memory_layout.c like the rest of
- * the register file. */
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS int g_fp_top;
-extern RECOMP_TLS uint16_t g_fp_control_word;
-extern RECOMP_TLS uint32_t g_mxcsr;
-extern RECOMP_TLS int g_fp_cmp;
+/* g_eax..g_edi, g_esp, g_seh_ebp and the x87 state (g_fp_stack, g_fp_top,
+ * g_fp_control_word, g_fp_cmp) come from xbox_memory_layout.h, through
+ * xboxrecomp.h above: fields of one thread-local struct, declared once in
+ * templates/runtime/recomp_cpu.h. Do not redeclare them here -- the names are
+ * macros, so it does not compile, and the hand-written declarations it
+ * replaces were how a register once came to be read from the wrong storage
+ * (a plain `extern` of a __declspec(thread) variable resolves to the image's
+ * TLS template, and the guest started with every register at zero).
+ *
+ * SSE state stays separate thread-locals. RECOMP_TLS is not optional here: a
+ * plain `extern` would resolve to the TLS template, as above. Global for the
+ * same reason the GPRs are: one guest routine can lift to several C
+ * functions, so a value written in one body is read in the next. */
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── XBE Constants ─────────────────────────────────────────── */
 
-#define TUROK_ENTRY_POINT       0x0001106F  /* XBE entry point VA */
-/* Default layout: ./game is the extracted disc (a junction is fine; see
- * scripts/extract-disc.ps1). TUROK_GAME_DIR overrides it. */
-#define TUROK_GAME_DIR_DEFAULT  "game"
+/*
+ * TODO: Set these from your xbe_parser output.
+ * Run: py -3 -m tools.xbe_parser game/default.xbe
+ */
+#define YOUR_GAME_ENTRY_POINT   0x0001106F  /* XBE entry point VA */
+/* Relative to the executable's own directory, build/<Config>/: the game/
+ * folder at the root of this repository. */
+#define YOUR_GAME_XBE_PATH      "..\\..\\game\\default.xbe"
+#define YOUR_GAME_DIR            "..\\..\\game"
+/* The image the console boots. A disc whose default.xbe only picks a language
+ * and launches another image names that one here. */
+#define YOUR_GAME_XBE_NAME       "default.xbe"
+
+/* ── Forward declarations ──────────────────────────────────── */
+
+/* Defined in recomp_trace.c. Declared here rather than pulled from
+ * the generated headers, which this file does not include. */
+void recomp_profile_dump(void);
+void recomp_exit_trace_init(void);      /* src/kernel/exit_trace.c */
+
+/* Defined in kernel_bridge.c: the APU is a separate library the kernel must
+ * not need to link, so the kernel takes its interrupt line as a callback. */
+void xbox_SetApuInterruptSource(int (*pending)(void));
+
+/* Generated with the lifted code (recomp_dispatch.c); declared in
+ * recomp_types.h, which this file does not include. */
+int recomp_dispatch_init(void);
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+
+/* ============================================================
+ * Finding the game, from wherever the executable was started
+ *
+ * A player double-clicks the executable, or runs a shortcut to it, and in
+ * neither case is the working directory anything in particular. So the game
+ * is looked for beside the executable rather than beside the caller:
+ *
+ *   0. macOS, when the executable is inside a .app: <folder of the .app>/game,
+ *      then <the .app>/Contents/Resources/game
+ *   1. <exe dir>\\game\\               -- what a distributed build looks like
+ *   2. <exe dir>\\YOUR_GAME_DIR     -- the development tree, where the build
+ *                                     sits several levels under the repo
+ *                                     (titles/<title>/build/<Config>/)
+ *   3. the same one level up        -- a single-configuration build
+ *                                     (Ninja: titles/<title>/build-mac/)
+ *
+ * RECOMP_GAME_DIR overrides all of them, for running one build against another copy
+ * of the game files.
+ * ============================================================ */
 
 static char g_game_dir[MAX_PATH];
 static char g_xbe_path[MAX_PATH];
 
-/* ── Renderer: host GPU when there is one, CPU otherwise ────────
- *
- * src/gpu_translator.c stands up a Direct3D 11 device; with it the pushbuffer
- * executor forwards every draw to the GPU translator (RECOMP_PB_D3D11).
- * Without a usable GPU, or with TUROK_RENDERER=cpu, the executor rasterises
- * on the CPU and the toolkit's framebuffer window shows the result
- * (RECOMP_FB_WINDOW). Both variables are decided here, before the title runs:
- * the executor and the window read them once, on first use. */
-int  gpu_translator_init(void);
-void gpu_translator_frame_end(void);
-#include "nv2a_pgraph_d3d11.h"
-
-static void choose_renderer(void)
+/* The paths below are written with backslashes, as Windows spells them;
+ * xbox_path_normalize turns them into forward slashes everywhere else and
+ * leaves them alone on Windows. */
+static BOOL file_exists(const char *path)
 {
-    if (gpu_translator_init()) {
-        _putenv_s("RECOMP_PB_D3D11", "1");
-        _putenv_s("RECOMP_FB_WINDOW", "");       /* empty removes it */
-#ifdef RECOMP_PGRAPH_FRAME_END_CALLBACK
-        pgraph_d3d11_set_frame_end_callback(gpu_translator_frame_end);
-#endif
-        printf("Renderer: GPU (Direct3D 11)\n");
-    } else {
-        _putenv_s("RECOMP_PB_D3D11", "");
-        if (!getenv("RECOMP_FB_WINDOW"))
-            _putenv_s("RECOMP_FB_WINDOW", "1");
-        printf("Renderer: CPU\n");
-    }
+    return host_file_exists(path);
 }
 
-/* ── Forward declarations ──────────────────────────────────── */
+/* Fills g_game_dir and g_xbe_path, or returns FALSE having left a message in
+ * `tried` naming every place that was looked at -- which is the only useful
+ * thing to tell somebody whose game files are somewhere else. */
+static BOOL find_game(char *tried, size_t tried_bytes)
+{
+    char exe[MAX_PATH], dir[MAX_PATH], candidate[MAX_PATH];
+    const char *env = getenv("RECOMP_GAME_DIR");
+    int i;
 
-static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+    tried[0] = '\0';
+    if (env && *env) {
+        snprintf(g_game_dir, sizeof g_game_dir, "%s", env);
+        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", env, YOUR_GAME_XBE_NAME);
+        xbox_path_normalize(g_game_dir);
+        xbox_path_normalize(g_xbe_path);
+        if (file_exists(g_xbe_path))
+            return TRUE;
+        snprintf(tried, tried_bytes, "RECOMP_GAME_DIR: %s", g_xbe_path);
+        return FALSE;
+    }
+
+#ifdef __APPLE__
+    /* A macOS application bundle (scripts/make_macos_app.py): the game
+     * folder beside the .app first, then one inside it. */
+    {
+        char app[MAX_PATH];
+
+        if (host_app_bundle_dir(app, sizeof app)) {
+            for (i = 0; i < 2; i++) {
+                snprintf(candidate, sizeof candidate, "%s", app);
+                if (i == 0) {
+                    host_path_dirname(candidate);
+                    strncat(candidate, "/game", sizeof candidate - strlen(candidate) - 1);
+                } else {
+                    strncat(candidate, "/Contents/Resources/game",
+                            sizeof candidate - strlen(candidate) - 1);
+                }
+                snprintf(g_xbe_path, sizeof g_xbe_path, "%s/%s", candidate, YOUR_GAME_XBE_NAME);
+                if (file_exists(g_xbe_path)) {
+                    snprintf(g_game_dir, sizeof g_game_dir, "%s", candidate);
+                    return TRUE;
+                }
+                {
+                    size_t n = strlen(tried);
+                    snprintf(tried + n, tried_bytes - n, "%s%s", n ? "\n" : "", g_xbe_path);
+                }
+            }
+        }
+    }
+#endif
+
+    if (!host_exe_path(exe, sizeof exe))
+        return FALSE;
+    snprintf(dir, sizeof dir, "%s", exe);
+    host_path_dirname(dir);
+
+    for (i = 0; i < 3; i++) {
+        if (i == 0)
+            snprintf(candidate, sizeof candidate, "%s\\game", dir);
+        else if (i == 1)
+            snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR);
+        else if (strncmp(YOUR_GAME_DIR, "..\\", 3) == 0)
+            snprintf(candidate, sizeof candidate, "%s\\%s", dir, YOUR_GAME_DIR + 3);
+        else
+            break;
+        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\%s", candidate, YOUR_GAME_XBE_NAME);
+        xbox_path_normalize(candidate);
+        xbox_path_normalize(g_xbe_path);
+        if (file_exists(g_xbe_path)) {
+            snprintf(g_game_dir, sizeof g_game_dir, "%s", candidate);
+            return TRUE;
+        }
+        {
+            size_t n = strlen(tried);
+            snprintf(tried + n, tried_bytes - n, "%s%s", n ? "\n" : "", g_xbe_path);
+        }
+    }
+    return FALSE;
+}
+
+
 
 /* Recompiled entry point (generated by recomp pipeline) */
 extern void xbe_entry_point(void);
 
-/* ── VEH crash handler ─────────────────────────────────────── */
+/* ── Fault handling ────────────────────────────────────────── */
 
 /*
- * Vectored Exception Handler for crash diagnostics.
+ * The runtime catches every host fault (src/platform/recomp_fault.h) and
+ * hands it first to xbox_fault_route (src/kernel/xbox_fault_route.c), which
+ * services the faults that are meant to happen -- a watchpoint, a trapped
+ * device register, the rest of a 16 KB host page a 4 KB trap covered -- and
+ * then to title_crash below, the report for everything else.
  *
- * When the recompiled game hits an access violation, this handler prints
+ * When the recompiled game hits an access violation, the report prints
  * the faulting address, all Xbox register values, and a native stack trace.
  * This is your primary debugging tool during bring-up.
  *
@@ -136,14 +252,15 @@ extern void xbe_entry_point(void);
  */
 /* Name the guest function a fault happened in, and recover the call chain.
  *
- * Recompiled code faults as ordinary native code, so the exception record
- * carries a host RIP and nothing else -- there is no guest program counter to
- * report, and the host address changes every build. Two things recover the
- * guest view:
+ * Recompiled code faults as ordinary native code, so the fault carries a
+ * host program counter and nothing else -- there is no guest program counter
+ * to report, and the host address changes every build. Two things recover
+ * the guest view:
  *
  *   - every generated function is a real symbol in the image (sub_005A03C0
- *     and so on), so the linker's PDB already maps host address back to guest
- *     function. dbghelp turns an anonymous RIP into that name.
+ *     and so on), so the symbols already map host address back to guest
+ *     function: host_symbol_name turns an anonymous pc into that name
+ *     (dbghelp and the .pdb beside the .exe on Windows, dladdr elsewhere).
  *
  *   - every lifted call pushes its guest return address onto the guest stack
  *     before jumping, so the stack still holds the chain. Scanning up from esp
@@ -153,23 +270,15 @@ extern void xbe_entry_point(void);
  * with no reliable ebp chain, so there is nothing to walk. It over-reports,
  * since addresses from returned-from calls linger below esp, but naming the
  * guest function is the whole question at a fault.
- *
- * Requires linking dbghelp and keeping the .pdb beside the .exe.
  */
-static void print_guest_context(void *rip)
+static void print_guest_context(uintptr_t pc)
 {
-    /* SYMBOL_INFO is variable-length: the name is written past the struct, so
-     * it must be over-allocated with MaxNameLen set to the slack. */
-    char buf[sizeof(SYMBOL_INFO) + 256];
-    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
-    DWORD64 disp = 0;
+    char name[256];
+    uintptr_t disp = 0;
 
-    memset(buf, 0, sizeof(buf));
-    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-    sym->MaxNameLen = 255;
-    if (SymFromAddr(GetCurrentProcess(), (DWORD64)(uintptr_t)rip, &disp, sym))
+    if (host_symbol_name(pc, name, sizeof name, &disp))
         fprintf(stderr, "  in %s+0x%llX\n",
-                sym->Name, (unsigned long long)disp);
+                name, (unsigned long long)disp);
 
     if (g_xbox_mem_offset && g_esp) {
         const uint32_t *sp =
@@ -183,107 +292,74 @@ static void print_guest_context(void *rip)
                 shown++;
             }
         }
-        /* When the frame is gone, say so, and fall back on what is left.
-         *
-         * A fault inside a block copy leaves no return address in range: the
-         * copy is a host memmove and its caller's frame is further up than
-         * this reaches. Worse, a copy that ran past its buffer overwrites the
-         * stack itself, so the list comes out empty exactly when it is most
-         * needed -- and an empty list under a promising heading reads like
-         * "nothing to see" rather than "the evidence is destroyed". */
-        if (!shown)
-            fprintf(stderr, "    (no return addresses in range)\n");
-
-        /* Everything below only pays for itself when the scan came back
-         * empty. A crash where the chain was recovered already says what
-         * happened, and burying that under another twenty lines makes the
-         * common report worse to read. */
-        if (!shown) {
-            uint32_t k;
-
-            /* The indirect-call history, which the stack cannot overwrite.
-             * recomp_manual.c prints this too, but only from
-             * recomp_icall_fail_log -- a page fault inside a block copy
-             * never reaches that path, and this is the same information by
-             * the route the fault actually took.
-             *
-             * Declared here rather than included: main.c does not pull in
-             * recomp_types.h, and recomp_manual.c spells it the same way. */
-            extern volatile uint32_t g_icall_trace[16];
-            extern volatile uint32_t g_icall_trace_idx;
-
-            fprintf(stderr, "  recent ICALL targets:");
-            for (k = 0; k < 16; k++)
-                fprintf(stderr, " %08X",
-                        g_icall_trace[(g_icall_trace_idx + k) & 15]);
-            fprintf(stderr, "\n");
-
-            /* The frame unfiltered. The pointers and lengths handed to
-             * whatever faulted live here and look nothing like code, so the
-             * filter above drops exactly what is wanted. On the crash this
-             * was written for, one of these words was the end of the mapped
-             * RAM mirror -- which is what identified the fault as a copy
-             * running off its buffer rather than a stray pointer. */
-            for (i = 0; i < 20; i++)
-                fprintf(stderr, "    raw[esp+%-4d] 0x%08X\n", i * 4, sp[i]);
-        }
+        /* And the raw words, because the useful thing is often not a
+         * return address. A fault through a garbage pointer is diagnosed
+         * by finding where the pointer came from, and the object it was
+         * loaded out of is usually sitting in the frame -- invisible in
+         * the filtered list above, which keeps only code addresses. */
+        fprintf(stderr, "  guest stack (raw):\n");
+        for (i = 0; i < 48; i += 4)
+            fprintf(stderr, "    [esp+%-3d] %08X %08X %08X %08X\n",
+                    i * 4, sp[i], sp[i + 1], sp[i + 2], sp[i + 3]);
     }
 }
 
-/* The emulated APU.
- *
- * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
- * documents apu_hook_handle_mmio as "called from VEH in main.c" and no main.c
- * called it; apu_decode_and_handle's first line is `if (!g_apu_state) return
- * false` and nothing assigned g_apu_state. So with RECOMP_AC97_READY set the
- * APU's registers were unmapped to be trapped, and every trap was then
- * declined and surfaced as an access violation on the first register
- * DirectSound touched. The VEH below now reaches apu_hook_handle_mmio
- * through the toolkit's xbox_VehMmioFault.
- *
- * Declared rather than included so this does not depend on src/apu being on
- * the include path. */
-typedef struct MCPXAPUState MCPXAPUState;
-extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
-extern MCPXAPUState *g_apu_state;
-
-static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
+/* Every fault the route declined, except breakpoints. Say something about
+ * every one, not only access violations: a fault this stays silent on reads
+ * as the process simply vanishing -- an exit code and nothing in the log. The
+ * GPU register range used to be skipped outright, and Burnout 2's first run
+ * on a fresh machine died that way, in a write to the vblank interrupt-enable
+ * register. */
+static void title_crash(const recomp_fault *f)
 {
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+    if (f->kind != RECOMP_FAULT_ACCESS) {
+        fprintf(stderr, "[EXCEPTION] code 0x%08lX at RIP=0x%llX (first chance)\n",
+                (unsigned long)f->code,
+                (unsigned long long)f->pc);
+        print_guest_context(f->pc);
+        fflush(stderr);
+        return;
+    }
 
-        /*
-         * GPU register probe at 0xFD000000 range.
-         * Some games probe NV2A registers directly. On real hardware this
-         * returns GPU state; here we just skip the instruction.
-         * TODO: Implement mini x86-64 decoder for instruction skipping,
-         * or connect to the xbox_nv2a library for proper handling.
-         */
-        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-
-        /* Trapped hardware registers (APU, USB OHCI) -> their models.
-         *
-         * The other half of RECOMP_AC97_READY: reporting the codec ready is
-         * what lets DirectSoundCreate past its first gate, and from there it
-         * drives the APU directly, so the registers have to fault to be seen.
-         * "Handled" means the access was decoded and the instruction stepped
-         * over, so execution resumes instead of unwinding. */
-        if (xbox_VehMmioFault(ep))
-            return EXCEPTION_CONTINUE_EXECUTION;
+    {
+        uintptr_t fault_addr = f->host_addr;
+        int is_write = f->is_write == 1;
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
-            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)f->pc,
             (unsigned long long)fault_addr,
-            ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+            f->is_write < 0 ? "access" : is_write ? "write" : "read");
         fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
             g_eax, g_ecx, g_edx, g_esp);
         fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
-        print_guest_context((void *)ep->ContextRecord->Rip);
+        /* The faulting instruction's bytes. When the fault is in a trapped
+         * device page, this is the instruction form the runtime's decoder
+         * did not know, which is exactly what has to be added to it. */
+        {
+            const uint8_t *ip = (const uint8_t *)f->pc;
+            int i;
+            fprintf(stderr, "  host instruction:");
+            for (i = 0; i < 12; i++)
+                fprintf(stderr, " %02X", ip[i]);
+            fprintf(stderr, "\n");
+        }
+        print_guest_context(f->pc);
+
+        /* Force the profile table out here, not at the next scheduled report.
+         * The report interval means the file on disk lags the run, and the
+         * fault lands inside that lag -- so without this, the functions that
+         * ran immediately before the crash are missing from it, and their
+         * absence reads as "never ran". */
+        recomp_profile_dump();
+
+        /* RECOMP_FIND_VALUE: when the fault is through a garbage pointer,
+         * the next question is who is holding it. Scanning guest RAM for
+         * the value names the field, and that field is what to point
+         * RECOMP_WATCH_WRITE at on the next run. */
+        xbox_watch_scan_on_crash();
 
         /*
          * TODO: Add game-specific diagnostics here. Examples:
@@ -297,122 +373,148 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          *   fprintf(stderr, "  Game state: %u\n", state);
          */
 
-        /* Print native stack return addresses for debugging */
+        /* Print native stack return addresses for debugging, named.
+         *
+         * The window is this module's own range (host_module_range), not a
+         * preferred base, which ASLR moves. The header and the leading
+         * "[i] 0x..." are kept as they were for anything that parses them. */
         {
-            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            const uintptr_t *sp = (const uintptr_t *)f->sp;
+            uintptr_t lo = 0, hi = 0;
+            int shown = 0;
             fprintf(stderr, "  Native stack (first 8 return addrs):\n");
-            for (int i = 0; i < 64 && sp[i]; i++) {
-                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
-                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+            if (sp && host_module_range(&lo, &hi)) {
+                for (int i = 0; i < 256 && shown < 12; i++) {
+                    char name[256];
+                    uintptr_t disp = 0;
+
+                    if (sp[i] < lo || sp[i] >= hi)
+                        continue;
+                    if (host_symbol_name(sp[i], name, sizeof name, &disp))
+                        fprintf(stderr, "    [%d] 0x%llX %s+0x%llX\n", i,
+                                (unsigned long long)sp[i], name,
+                                (unsigned long long)disp);
+                    else
+                        fprintf(stderr, "    [%d] 0x%llX (module+0x%llX)\n", i,
+                                (unsigned long long)sp[i],
+                                (unsigned long long)(sp[i] - lo));
+                    shown++;
                 }
             }
         }
         fflush(stderr);
     }
-
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 
-/* ── WinMain ───────────────────────────────────────────────── */
+/* ── Start-up ──────────────────────────────────────────────── */
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
-                   LPSTR lpCmdLine, int nCmdShow)
+/* Where the diagnostics go: host_setup_output (src/platform/host_main.h).
+ * A windowed program started by double-click has no console, so its output
+ * goes to <executable>.log unless it was redirected or started from a
+ * terminal. The log's path is remembered so a failure can name it in its
+ * message box: "it did not start" is not a bug report, and the file is. */
+static char g_log_path[MAX_PATH];
+
+/* Appended to a message box, when there is a file worth reading. */
+static void log_hint(char *buf, size_t bytes)
+{
+    size_t n = strlen(buf);
+
+    if (g_log_path[0] && bytes > n)
+        snprintf(buf + n, bytes - n, "\n\nThere is more in:\n%s", g_log_path);
+}
+
+/* The title, start to finish: the same on every host. On POSIX it runs on a
+ * thread of its own (host_main_posix), so the process's main thread is free
+ * for the window. */
+static int title_main(int argc, char **argv)
 {
     void *xbe_data = NULL;
     size_t xbe_size = 0;
 
-    (void)hInstance;
-    (void)hPrevInstance;
-    (void)lpCmdLine;
-    (void)nCmdShow;
+    (void)argc;
+    (void)argv;
 
-    /* Unbuffered output for immediate visibility during debugging */
+    /* Before anything prints: a windowed program has nowhere to print
+     * unless this says where. */
+    host_setup_output(g_log_path, sizeof g_log_path);
+
+    /* Unbuffered output for immediate visibility during debugging, and so a
+     * crash keeps the tail of the log rather than losing it in a buffer. */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
     printf("=== Turok: Evolution - Static Recompilation ===\n");
-
-    /* Defaults this title needs, before the runtime reads them. Each is only
-     * set when the user has not set it already.
-     *
-     * RECOMP_PB_EXEC: Turok links XDK D3D statically and writes NV2A methods
-     * straight into the pushbuffer. Without the executor nothing runs them,
-     * nothing releases D3D's GPU semaphore, and the first fence wait in D3D
-     * init never returns (see sub_00198650_enter in recomp_manual.c). */
-    if (!getenv("RECOMP_PB_EXEC"))
-        _putenv_s("RECOMP_PB_EXEC", "1");
-    /* RECOMP_AC97_READY: the emulated APU. DirectSound's effects-image
-     * download (Data\Sound\dsstdfx.bin) writes a command to the DSP's mailbox
-     * and spins until the DSP clears it (sub_001B1BEB, 0x001B1D52); without
-     * the APU nothing answers and boot stops there. */
-    if (!getenv("RECOMP_AC97_READY"))
-        _putenv_s("RECOMP_AC97_READY", "1");
-    /* RECOMP_VBLANK: the vertical-blank interrupt. XDK D3D waits on events
-     * its GPU interrupt routine (0x0019D390) signals; without vblanks the
-     * first such wait in D3D init (event at 0x001A44E4) never returns. */
-    if (!getenv("RECOMP_VBLANK"))
-        _putenv_s("RECOMP_VBLANK", "1");
-    /* Audio, as FFNY Online runs the same emulated APU: six 512-sample
-     * XAudio2 buffers (64 ms) instead of four, which clicked whenever a
-     * present waited on the display, and 3D voices without HRTF until a
-     * listening comparison says otherwise. */
-    if (!getenv("RECOMP_AUDIO_BUF_COUNT"))
-        _putenv_s("RECOMP_AUDIO_BUF_COUNT", "6");
-    if (!getenv("RECOMP_APU_HRTF"))
-        _putenv_s("RECOMP_APU_HRTF", "0");
-    /* The renderer (GPU or CPU) is chosen after the memory layout is up; see
-     * choose_renderer() below. */
-    {
-        const char *d = getenv("TUROK_GAME_DIR");
-        snprintf(g_game_dir, sizeof g_game_dir, "%s",
-                 (d && *d) ? d : TUROK_GAME_DIR_DEFAULT);
-        snprintf(g_xbe_path, sizeof g_xbe_path, "%s\\default.xbe", g_game_dir);
-    }
     printf("Loading XBE...\n");
 
-    /* Install VEH handler (first handler in chain) */
-    /* Load symbols up front rather than from inside the handler: at fault
-     * time the process is already in a bad way, and SymInitialize
-     * allocates. Failure is not fatal -- the handler prints no name. */
-    SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
-    SymInitialize(GetCurrentProcess(), NULL, TRUE);
-    AddVectoredExceptionHandler(1, veh_handler);
+    /* The fault handler, first in line: a VEH on Windows, signals on POSIX.
+     * It loads the symbols the report names functions with up front, since
+     * at fault time the process is already in a bad way. */
+    recomp_fault_install(xbox_fault_route, title_crash);
+    /* And the other way a run ends: an exit nobody logged. Prints [EXIT]
+     * with the code and both stacks before the process goes (exit_trace.c). */
+    recomp_exit_trace_init();
 
-    /* Step 1: Load XBE */
-    if (!load_xbe(g_xbe_path, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
-                    "Extract your own Turok: Evolution disc into the 'game' folder\n"
-                    "(or set TUROK_GAME_DIR). See README.md.",
-                    "Recomp", MB_ICONERROR);
-        return 1;
+    /* Step 1: Find and load the XBE */
+    {
+        char tried[1024], message[1400];
+
+        if (!find_game(tried, sizeof tried)) {
+            snprintf(message, sizeof message,
+                     "This needs the game's own files, which are not included.\n\n"
+                     "Put them in a folder called \"game\" next to this program, so that\n"
+                     "\"game\\" YOUR_GAME_XBE_NAME "\" exists, or set RECOMP_GAME_DIR to where they are.\n\n"
+                     "Looked for:\n%s", tried);
+            fprintf(stderr, "%s\n", message);
+            log_hint(message, sizeof message);
+            host_error_box("Turok: Evolution", message);
+            return 1;
+        }
+        printf("Game files: %s\n", g_game_dir);
+        if (!load_xbe(g_xbe_path, &xbe_data, &xbe_size)) {
+            snprintf(message, sizeof message,
+                     "Found the game at\n%s\nbut could not read " YOUR_GAME_XBE_NAME ".",
+                     g_game_dir);
+            fprintf(stderr, "%s\n", message);
+            log_hint(message, sizeof message);
+            host_error_box("Turok: Evolution", message);
+            return 1;
+        }
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
     if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
-        MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
-                    "The required virtual address range may be unavailable.",
-                    "Recomp", MB_ICONERROR);
+        static const char layout_failed[] =
+            "Failed to initialize Xbox memory layout.\n"
+            "The required virtual address range may be unavailable.";
+        fprintf(stderr, "%s\n", layout_failed);
+        host_error_box("Recomp", layout_failed);
         free(xbe_data);
         return 1;
     }
 
+    /* The layout has copied out everything it needs (headers, sections,
+     * certificate, TLS directory) into guest memory and its own statics,
+     * and nothing keeps a pointer into the file buffer, so let it go now
+     * rather than at exit: it is the whole XBE (45 MB on BLiNX). */
+    free(xbe_data);
+    xbe_data = NULL;
+#ifdef __APPLE__
+    /* macOS's allocator keeps a freed large block cached, still resident,
+     * for reuse: BLiNX's 42.7 MB stayed in the footprint as "Malloc Large
+     * (empty)" after the free. Ask it to hand cached memory back now. */
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
+
     g_xbox_mem_offset = xbox_GetMemoryOffset();
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
 
-    /* Bring up the emulated APU.
-     *
-     * Gated on the same variable that unmaps its registers, because the two
-     * halves are useless apart: a trap with no model declines every access,
-     * and a model nothing traps into never sees a register. The APU walks
-     * Xbox physical RAM to find voice buffers, so it gets the guest RAM
-     * base. */
-    if (getenv("RECOMP_AC97_READY")) {
-        g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
-        fprintf(stderr, "[BOOT] emulated APU %s\n",
-                g_apu_state ? "up" : "FAILED to initialise");
-    }
+    /* The device registers the layout traps (the vblank interrupt page, the
+     * APU, AC'97), registered with the fault route that services them. Only
+     * a table: a range whose page is never trapped never faults. */
+    apu_fault_register();
 
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
@@ -421,26 +523,49 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
-        /* Saves and the HDD partition images get a folder of their own:
-         * the toolkit's default (%LOCALAPPDATA%\xboxrecomp) is shared by
-         * every title built on it. TUROK_SAVE_DIR overrides it. */
-        char save_dir[MAX_PATH];
-        const char *sd = getenv("TUROK_SAVE_DIR");
-        const char *la = getenv("LOCALAPPDATA");
-        if (sd && *sd)
-            snprintf(save_dir, sizeof save_dir, "%s", sd);
-        else
-            snprintf(save_dir, sizeof save_dir, "%s\\TurokEvolutionRecomp",
-                     la ? la : ".");
-        CreateDirectoryA(save_dir, NULL);
-        xbox_path_init(g_game_dir, save_dir);
+        xbox_path_init(g_game_dir, NULL);
     }
-
-    choose_renderer();
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+
+    /* Step 5a: memory watchpoints, if any were asked for. After the
+     * bridge, so the pages a watch names are mapped and committed. */
+    xbox_watch_init();
+
+    /* Step 5b: the emulated APU, when its registers are trapped.
+     *
+     * RECOMP_AC97_READY makes the memory layout report the audio codec as
+     * present and turn the APU's register pages into faults, so the title's
+     * DirectSound can be answered by the emulated APU instead of by plain
+     * memory. The fault handler above routes those faults to
+     * apu_hook_handle_mmio(), which declines every access -- silently --
+     * until the device exists. Create it under the same switch, and hand the
+     * kernel its interrupt line so the timer thread can deliver it. */
+    /* On unless turned off: the emulated audio hardware is not an
+     * experiment any more, and without it the first DirectSound register
+     * the title touches faults. xbox_EnvSwitch, so RECOMP_AC97_READY=0
+     * still takes it away. */
+    if (xbox_EnvSwitch("RECOMP_AC97_READY", 1)) {
+        /* The fault handler serves from g_apu_state, and init returns the
+         * device rather than storing it: left unassigned, every APU register
+         * access was declined and reported as a crash reading 0xFE801100
+         * (NV_PAPU_FECTL), the first register DirectSound touches. */
+        /* The APU addresses guest memory physically, and in this runtime
+         * physical page P lives in the contiguous window at
+         * XBOX_CONTIG_BASE + P, not at guest VA P: the low 64 MB of VA is
+         * the image and the heap, a different mapping. Handing it VA 0 made
+         * every DirectSound buffer and DSP page table read the wrong bytes;
+         * TimeSplitters 2's scatter-gather tables all read as empty. */
+        g_apu_state = mcpx_apu_init_standalone(
+            (uint8_t *)g_xbox_mem_offset + XBOX_CONTIG_BASE);
+        if (!g_apu_state)
+            fprintf(stderr, "[BOOT] APU init failed; APU register accesses "
+                            "will fault\n");
+        else
+            xbox_SetApuInterruptSource(mcpx_apu_irq_pending);
+    }
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;
@@ -460,7 +585,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      */
 
     printf("\n=== Initialization complete ===\n");
-    printf("Entry point: 0x%08X\n", TUROK_ENTRY_POINT);
+    printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
     printf("ESP: 0x%08X\n", g_esp);
 
     /* Build the flat dispatch table before the guest runs.
@@ -541,10 +666,31 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
+/* ── Entry points ──────────────────────────────────────────── */
+
+#ifdef _WIN32
+/* The windowed program's entry point. */
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow)
+{
+    (void)hInstance;
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+    return title_main(__argc, __argv);
+}
+
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
-    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+    return title_main(argc, argv);
 }
+#else
+/* The title runs on its own thread; this, the process's main thread, runs
+ * the host loop that every window needs on macOS (src/host). */
+int main(int argc, char **argv)
+{
+    static const host_loop loop = { recomp_host_loop_run, recomp_host_loop_quit };
+    return host_main_posix(argc, argv, title_main, &loop);
+}
+#endif

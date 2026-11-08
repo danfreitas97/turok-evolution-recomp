@@ -1,41 +1,19 @@
-# ---- NEVER commit game data: bring your own disc ----
-*.iso
-*.xiso
-*.xbe
-*.xmv
-*.tre
-*.7z
-*.zip
-*.rar
+# The game: bring your own copy (see README.md). Never commit it.
 /game
-/game/
-extracted/
-src/recomp/gen/*
-!src/recomp/gen/.gitkeep
 
-# ---- build output ----
+# Lifted from the game, so it is game code: generated on your machine only.
+src/recomp/
+
+# Pipeline stage outputs and the build.
+.pipeline/
 build/
-out/
-*.obj
-*.pdb
-*.ilk
-*.exe
-*.dll
-*.lib
-*.map
 
-# ---- runtime logs / captures ----
-logs/
 *.log
+*.d3dcap
 *.bmp
-*.ppm
-
-# ---- editors / OS / python ----
-.vs/
-.vscode/
-.idea/
-Thumbs.db
-.DS_Store
 __pycache__/
-*.pyc
-.venv/
+
+# A local mod folder for testing (RECOMP_MODS_DIR); mods are the player's own.
+mods/
+
+logs/

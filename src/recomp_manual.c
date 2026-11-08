@@ -20,7 +20,41 @@
 
 #include <stdio.h>
 #include <stdint.h>
-#include <stddef.h>   /* ptrdiff_t */
+#include <stddef.h>   /* ptrdiff_t: not in stdlib.h off MSVC */
+#include <stdlib.h>   /* getenv, exit: the spin verdict below */
+#include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
+#ifndef _MSC_VER
+#  include <strings.h>                  /* strncasecmp */
+#  define _strnicmp strncasecmp
+#endif
+
+/* One diagnostic report, one piece.
+ *
+ * Each report below is a dozen fprintf calls and the CRT takes its lock per
+ * call, so with more than one guest thread running the lines interleave in
+ * the middle of a report. Dino Crisis 3 runs six workers once it is past its
+ * menus, and its log came out like this:
+ *
+ *   callers: 0x004DB424 <- 0x002705B4 <- 0x002705B4[ICALL] unresolved jump
+ *   target 0x41B0B870 -- 1 time(s) (total calls: 6930990)
+ *
+ * -- two threads' reports spliced together, with a caller list that stops
+ * mid-sentence and an address that belongs to neither line as read. These
+ * diagnostics exist to be read during exactly the multi-threaded bring-up
+ * that breaks them.
+ *
+ * The CRT exposes the lock these calls were already taking one at a time, so
+ * hold it across the whole report instead. */
+#if defined(_MSC_VER)
+#  define RECOMP_DIAG_LOCK()   _lock_file(stderr)
+#  define RECOMP_DIAG_UNLOCK() _unlock_file(stderr)
+#elif defined(__unix__) || defined(__APPLE__)
+#  define RECOMP_DIAG_LOCK()   flockfile(stderr)
+#  define RECOMP_DIAG_UNLOCK() funlockfile(stderr)
+#else
+#  define RECOMP_DIAG_LOCK()   ((void)0)
+#  define RECOMP_DIAG_UNLOCK() ((void)0)
+#endif
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -46,8 +80,34 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern uint32_t g_eax;
+/* The guest registers (g_eax, g_esp, g_icall_saved_esp, ...) are fields of
+ * one thread-local struct, declared once in recomp_cpu.h, which the lifter
+ * copies into gen/ beside the code it describes. Take them from there; never
+ * redeclare one here. They used to be redeclared by hand, and a declaration
+ * without the thread-local storage class linked and silently read other
+ * storage, so every read got 0 -- which is why the log below once reported
+ * no call site: not because the guest esp was stale, but because this file
+ * was not reading the guest esp at all. The names are macros now, so a
+ * redeclaration no longer compiles. */
+#include "recomp/gen/recomp_cpu.h"
+
+/* g_eax: recomp_cpu.h. */
+/* The guest stack pointer. At the moment an indirect call is refused, the
+ * caller has already pushed its guest return address, so the top of the
+ * guest stack is the call site -- the one thing the old log did not say. */
+/* g_esp: recomp_cpu.h. */
 extern ptrdiff_t g_xbox_mem_offset;
+/* The lifted code sections, so a value on the guest stack can be told
+ * apart from data when naming the callers of a refused call. */
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
+/* The esp the dispatch macro captured. Not g_esp, which is stale by the time
+ * a refused call is reported. Zero when the title's generated header predates
+ * this, and the log then says it has no callers rather than inventing them. */
+/* g_icall_saved_esp: recomp_cpu.h. */
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump. Unknown
+ * means this title was lifted before the macros published it. */
+/* g_icall_dispatch_form: recomp_cpu.h. */
 
 /* ── Manual function overrides ─────────────────────────────── */
 
@@ -99,56 +159,6 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     return (recomp_func_t)0;
 }
 
-/* ── XDK D3D: the GPU-progress semaphore ──────────────────────
- *
- * Turok links XDK 4627's Direct3D statically. Its fence wait, sub_00198650
- * (D3D's BlockOnTime: time, flags), spins until the GPU has caught up with a
- * point in the pushbuffer:
- *
- *     dev = *(0x001A1AD0);
- *     while (dev->[0x30] - time >= dev->[0x30] - *dev->[0x34]) ;
- *
- * dev->[0x30] is the write sequence and dev->[0x34] points at the semaphore
- * the GPU releases values into as it finishes work. (The toolkit's notes
- * describe the same layout one word earlier, 0x2C/0x30, for a later XDK.)
- * Nothing wrote that semaphore, so the first wait under D3D init spun for
- * good with NV2A PUT == GET.
- *
- * With RECOMP_PB_EXEC the pushbuffer executor writes each
- * BACK_END_WRITE_SEMAPHORE_RELEASE where it is told to. This tells it, the
- * first time the wait runs and again if D3D moves the semaphore (device
- * reset). D3D's ring-space checks read the same word, so they become honest
- * too, without a hook of their own.
- *
- * An entry hook, not a replacement: the generated body still does D3D's own
- * work (the kickoff of the release it waits for, the event wait path). */
-#define TUROK_D3D_DEVICE_PTR   0x001A1AD0u
-#define D3D_DEV_GPU_SEMAPHORE  0x34u
-
-extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
-
-static uint32_t guest32(uint32_t va)
-{
-    return *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + va);
-}
-
-void sub_00198650_enter(void)
-{
-    static uint32_t s_semaphore;
-    uint32_t dev = guest32(TUROK_D3D_DEVICE_PTR);
-    uint32_t sem;
-
-    if (!dev)
-        return;
-    sem = guest32(dev + D3D_DEV_GPU_SEMAPHORE);
-    if (sem && sem != s_semaphore) {
-        s_semaphore = sem;
-        nv2a_pb_set_semaphore_target(sem);
-        fprintf(stderr, "[D3D] GPU semaphore at 0x%08X (device 0x%08X)\n", sem, dev);
-        fflush(stderr);
-    }
-}
-
 /* ── ICALL failure logging ─────────────────────────────────── */
 
 /*
@@ -164,19 +174,95 @@ void sub_00198650_enter(void)
  */
 void recomp_icall_fail_log(uint32_t va)
 {
-    fprintf(stderr, "[ICALL] Failed to resolve VA 0x%08X (total calls: %llu)\n",
-            va, (unsigned long long)g_icall_count);
+    /*
+     * Rate-limited per target, reporting at 1, 10, 100 ...
+     *
+     * An unresolved target inside a loop is the normal case, not the rare
+     * one: Mortal Kombat: Deadly Alliance produced 46843 of these for a
+     * single address in one 30-second run, seventeen lines each. That buries
+     * every other diagnostic in the log and says nothing the first report did
+     * not. The progression is the useful part -- one line says a target was
+     * never identified, a run of them says the title is stuck on it.
+     */
+    enum { SLOTS = 16 };
+    static uint32_t seen[SLOTS];
+    static uint64_t hits[SLOTS];
+    static int count;
+    int i;
 
-    /* Dump last 16 call targets from the ring buffer */
-    fprintf(stderr, "  Recent ICALL targets:\n");
-    for (int i = 0; i < 16; i++) {
-        int idx = (g_icall_trace_idx - 16 + i) & 15;
-        if (g_icall_trace[idx])
-            fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+    for (i = 0; i < count; i++)
+        if (seen[i] == va)
+            break;
+    if (i == count) {
+        if (count == SLOTS)
+            return;
+        seen[count] = va;
+        hits[count] = 0;
+        count++;
     }
+    hits[i]++;
+    {
+        uint64_t n = hits[i];
+        while (n >= 10 && n % 10 == 0)
+            n /= 10;
+        if (n != 1)
+            return;
+    }
+
+    RECOMP_DIAG_LOCK();
+    fprintf(stderr, "[ICALL] unresolved %starget 0x%08X -- %llu time(s) "
+                    "(total calls: %llu)\n",
+            g_icall_dispatch_form == 1 ? "call " :
+            g_icall_dispatch_form == 2 ? "jump " : "",
+            va, (unsigned long long)hits[i],
+            (unsigned long long)g_icall_count);
+    if (g_icall_dispatch_form == 2 && hits[i] == 1)
+        fprintf(stderr, "  a jump, not a call: if this address is inside a "
+                        "function rather than at its start, the guest is doing "
+                        "its own control flow (a coroutine, a longjmp, or a "
+                        "switch arm) and seeding it as a function will not "
+                        "help\n");
+
+    /*
+     * Who called it. The lifted caller pushed its return address on the guest
+     * stack, so code-range values above esp name the chain -- the same scan
+     * the memory watchpoints use. It is a heuristic: stale return addresses
+     * from earlier frames show up too, and the first entry is the reliable
+     * one. It is still the difference between an address with no context and
+     * a function to open, which is what an unresolved target needs.
+     */
+    {
+        const uint8_t *stack = (const uint8_t *)g_xbox_mem_offset
+                             + g_icall_saved_esp;
+        int shown = 0;
+        fprintf(stderr, "  callers:");
+        for (i = 0; g_xbox_mem_offset && g_icall_saved_esp
+                    && i < 160 && shown < 6; i++) {
+            uint32_t v;
+            memcpy(&v, stack + (size_t)i * 4, sizeof v);
+            if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                shown++;
+            }
+        }
+        if (!shown)
+            fprintf(stderr, " (none on the stack)");
+        fprintf(stderr, "\n");
+    }
+
+    /* The recent-target ring buffer, once per address. What ran just before
+     * an unresolved call is context for the first report and noise after. */
+    if (hits[i] == 1) {
+        fprintf(stderr, "  Recent ICALL targets:\n");
+        for (i = 0; i < 16; i++) {
+            int idx = (g_icall_trace_idx - 16 + i) & 15;
+            if (g_icall_trace[idx])
+                fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
+        }
+    }
+    RECOMP_DIAG_UNLOCK();
     fflush(stderr);
 }
-
 /* An indirect call whose target is not code: a null or wild function pointer.
  *
  * Skipping these is right -- calling a data address is worse -- but skipping
@@ -186,12 +272,17 @@ void recomp_icall_fail_log(uint32_t va)
  * Rate-limited per address: a spin can produce millions of these, and the
  * useful information is which addresses occur, not how often.
  */
-void recomp_icall_not_code_log(uint32_t va)
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
 {
-    enum { SLOTS = 16 };
+    /* A power of ten, because the rate limiter above only reaches this
+     * function body at 1, 10, 100 ... and the verdict has to land on one of
+     * those. A hundred thousand skips of one target is unambiguous: no title
+     * makes progress through that. */
+    enum { SLOTS = 16, SPIN_VERDICT = 100000 };
     static uint32_t seen[SLOTS];
     static uint64_t hits[SLOTS];
     static int count;
+    static int said_it;   /* the verdict below is said once, not once per target */
     int i;
 
     for (i = 0; i < count; i++)
@@ -216,35 +307,218 @@ void recomp_icall_not_code_log(uint32_t va)
         if (n != 1)
             return;
     }
-    fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped %llu time(s) "
-                    "(null or wild function pointer, at call #%llu)\n",
-            va, (unsigned long long)hits[i],
-            (unsigned long long)g_icall_count);
+    {
+        /* The call site, read off the guest stack. Without it the log
+         * says a wild pointer was skipped but not by whom, and the
+         * caller is the only thing that leads anywhere.
+         *
+         * It comes from the esp the dispatch macro captured, not from
+         * g_esp. The lifted call site pushes its return address onto the
+         * *local* esp and only syncs g_esp at certain points, so g_esp is
+         * stale here -- it read 0 exactly when a null target most needed
+         * explaining, which sent three rounds of Jet Set Radio Future
+         * chasing inferences instead of a call site. saved_esp is the value
+         * before that push, so the return address is the dword below it.
+         *
+         * Only for the call form. A tail jump pushes no return address, so
+         * that dword is whatever the frame happened to leave there: Tony
+         * Hawk's Pro Skater 2X reported "from 0x00000008" and then "from
+         * 0x00000004" for the same million skipped calls, and both are
+         * plainly not code. Printing a number that cannot be an address as
+         * though it were the caller is worse than printing nothing, because
+         * it is the one field a reader goes to next.
+         *
+         * So: name the form, and where the top of the stack cannot answer,
+         * scan for code-range values the way the unresolved-target logger
+         * above does. Stale return addresses from earlier frames come back
+         * too and the first is the reliable one, but a list of real code
+         * addresses is a place to start and 0x00000008 is not. */
+        uint32_t caller = 0;
+        if (g_icall_dispatch_form != 2 && saved_esp >= 4 && g_xbox_mem_offset)
+            caller = *(const uint32_t *)((const uint8_t *)g_xbox_mem_offset
+                                         + (saved_esp - 4));
+        if (caller < g_xbox_code_lo || caller >= g_xbox_code_hi)
+            caller = 0;
+        RECOMP_DIAG_LOCK();
+    fprintf(stderr, "[ICALL] target 0x%08X is not code -- skipped "
+                        "%llu time(s) via a %s",
+                va, (unsigned long long)hits[i],
+                g_icall_dispatch_form == 2 ? "jump" : "call");
+        if (caller)
+            fprintf(stderr, " from 0x%08X", caller);
+        fprintf(stderr, " (null or wild function pointer, at call #%llu)\n",
+                (unsigned long long)g_icall_count);
+
+        /* The stack scan, once per address: the same heuristic the
+         * unresolved-target logger uses, and the only thing that names a
+         * caller when the return address is not where it should be. */
+        if (hits[i] == 1) {
+            const uint8_t *stack = (const uint8_t *)g_xbox_mem_offset
+                                 + saved_esp;
+            int shown = 0, k;
+            fprintf(stderr, "  callers:");
+            for (k = 0; g_xbox_mem_offset && saved_esp
+                        && k < 160 && shown < 6; k++) {
+                uint32_t v;
+                memcpy(&v, stack + (size_t)k * 4, sizeof v);
+                if (v >= g_xbox_code_lo && v < g_xbox_code_hi) {
+                    fprintf(stderr, "%s 0x%08X", shown ? " <-" : "", v);
+                    shown++;
+                }
+            }
+            if (!shown)
+                fprintf(stderr, " (none on the stack)");
+            fprintf(stderr, "\n");
+        }
+
+        /* RECOMP_ICALL_FATAL=1: fault here instead of skipping, so the crash
+         * handler prints the guest call stack that reached this call.
+         *
+         * The caller printed above is read from the top of the guest stack,
+         * which is right only when the lifted call site pushed a return
+         * address there and nothing has since moved esp. When it reads 0 --
+         * exactly the case where a null target most needs explaining -- the
+         * line says a wild pointer was skipped and nothing about by whom. A
+         * deliberate fault costs the run and buys the backtrace. */
+        {
+            static int fatal = -1;
+            if (fatal < 0) {
+                const char *v = getenv("RECOMP_ICALL_FATAL");
+                fatal = v && *v && strcmp(v, "0") != 0;
+            }
+            if (fatal) {
+                fprintf(stderr, "[ICALL] RECOMP_ICALL_FATAL: faulting here for "
+                                "a backtrace\n");
+                fflush(stderr);
+                *(volatile int *)0 = 1;
+            }
+        }
+    }
+
+    /* Past a certain count this stops being a warning and becomes a verdict.
+     *
+     * A skipped call sets eax to 0 and returns. Zero is a fine answer for a
+     * null function pointer in most code -- it reads as NULL, false, or
+     * nothing -- but it is also S_OK, so in COM-shaped code a loop that
+     * repeats while the result is non-negative can never leave. Panzer
+     * Dragoon Orta hung exactly there, three billion skips in forty seconds,
+     * with no frame ever presented.
+     *
+     * The value is deliberately left alone: there is no return value that is
+     * right for both conventions, and guessing failure would break the
+     * callers for which zero is correct. What can be fixed is the silence.
+     * Say plainly that the title is hung, once, and say what to do about it.
+     */
+    if (hits[i] == SPIN_VERDICT && !said_it) {
+        said_it = 1;
+        fprintf(stderr,
+            "[ICALL] ^^ this is a hang, not slow progress. One target has been\n"
+            "        skipped %d times. The skip returns eax = 0, which is also\n"
+            "        S_OK, so a loop testing for a non-negative result will\n"
+            "        never exit. Try `py -3 -m tools.seed_from_log <log>` to\n"
+            "        recover the target as a function, and read\n"
+            "        docs/technical/memory-watchpoints.md for who wrote the\n"
+            "        pointer. Set RECOMP_ICALL_SPIN_FATAL=1 to stop here\n"
+            "        instead of spinning.\n", SPIN_VERDICT);
+        fflush(stderr);
+        if (getenv("RECOMP_ICALL_SPIN_FATAL")) {
+            fprintf(stderr, "[ICALL] RECOMP_ICALL_SPIN_FATAL is set; exiting.\n");
+            fflush(stderr);
+            exit(3);
+        }
+    }
+    RECOMP_DIAG_UNLOCK();
     fflush(stderr);
 }
 
-/* ── Untranslated instructions ───────────────────────────────────────────
+
+/* ── Turok: Evolution ──────────────────────────────────────── */
+
+#include "recomp/gen/recomp_funcs.h"
+
+/* ── Widescreen: which screen the game is on ──────────────────
  *
- * The lifter emits RECOMP_UNIMPL(text, va) at every instruction it has no
- * translation for, in place of the bare comment it used to leave. The
- * instruction is still a no-op; this only stops the omission being silent.
- * RECOMP_UNIMPL_TRAP=1 aborts at the first hit, at the guest address of the
- * cause rather than wherever the damage surfaces. */
-#include <stdlib.h>
+ * Turok has no 16:9 mode of its own: CreateDevice gets no widescreen flag
+ * and the game never reads the console's video flags (XC_VIDEO). Its world
+ * is drawn by vertex programs from a model-view-projection the game builds
+ * on the CPU for every object and loads at c96..c99, oPos.x = dp4(v0, c96),
+ * so the toolkit widens the view by scaling c96 on screen draws
+ * (CMakeLists.txt: recomp_title_widescreen(HOR_PLUS REGISTER 96)).
+ *
+ * The front end is a 3D stage built for 4:3 -- the title screen's jungle
+ * set ends just past the 4:3 edges -- so it is shown 4:3 between bars, as
+ * are frames with nothing in 3D (the XMV movies). The game says which screen
+ * it is entering by the precache list it loads for it:
+ * sub_00054A60 (this-call) builds y:\data\precachelists\autolists\<name>.pcl
+ * from the name at this+0x20 -- bootupsequence, splashsequence, intro,
+ * frontendbackground, firstinteractivescreen, initialspacecheck, mainmenu,
+ * newgame, gamestart.
+ * Everything from gamestart on is the game; a front-end list after it is
+ * the way back out. */
+extern void xbox_D3D8SetWideFrames(int wide);
+extern void xbox_D3D8SetWideFramesAuto(int on);
+extern void sub_00054A60_gen(void);
 
-void recomp_unimpl(const char *text, uint32_t va)
+static int tk_is_front_end(const char *name)
 {
-    static int printed;
-    const char *trap = getenv("RECOMP_UNIMPL_TRAP");
-    int stop = trap && *trap && *trap != '0';
+    static const char *const front[] = {
+        "begin", "bootupsequence", "splashsequence", "intro", "frontendbackground",
+        "firstinteractivescreen", "initialspacecheck", "mainmenu", "newgame",
+    };
+    const char *base = name, *p;
+    size_t i, n;
 
-    if (printed < 50 || stop) {
-        printed++;
-        fprintf(stderr,
-                "[UNIMPL] untranslated instruction REACHED: `%s` at 0x%08X"
-                " (a no-op; set RECOMP_UNIMPL_TRAP=1 to stop here)\n",
-                text, va);
-        fflush(stderr);
+    for (p = name; *p; p++)
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    n = strcspn(base, ".");
+    for (i = 0; i < sizeof front / sizeof front[0]; i++)
+        if (strlen(front[i]) == n && _strnicmp(base, front[i], n) == 0)
+            return 1;
+    return 0;
+}
+
+void sub_00054A60(void)
+{
+    static int started;
+    uint32_t self = g_ecx;
+    uint32_t name_va = self ? *(volatile uint32_t *)((uintptr_t)self + 0x20u + g_xbox_mem_offset) : 0;
+
+    if (!started) {
+        started = 1;
+        xbox_D3D8SetWideFramesAuto(1);
     }
-    if (stop) abort();
+    if (name_va) {
+        const char *name = (const char *)((uintptr_t)name_va + g_xbox_mem_offset);
+        char shown[64];
+        int front = tk_is_front_end(name);
+
+        snprintf(shown, sizeof shown, "%s", name);
+        fprintf(stderr, "[TUROK] screen %s: %s\n", shown, front ? "front end, 4:3" : "game");
+        xbox_D3D8SetWideFrames(!front);
+    }
+    sub_00054A60_gen();
+}
+
+/* ── Widescreen: edge effects span the screen ──────────────────
+ *
+ * Every 2D image the game draws goes through sub_0009C9A0, one
+ * pre-transformed quad each: the health box, the front end's panels, and
+ * the damage indicator, which lights the side a hit came from with
+ * quarter-screen quads that overhang the screen's edge (x 329.6 to 649.6).
+ * Half the width, those read as HUD pieces to the renderer and were
+ * squeezed into the middle 4:3, so the red stopped short of the screen's
+ * edges. EDGE spans a draw that reaches the left or right edge and leaves
+ * the rest to the renderer's judgement, so the health box stays at 4:3. */
+extern void xbox_D3D8SetTwoDPlacement(int placement, uint32_t tag);
+extern void sub_0009C9A0_gen(void);
+
+#define TK_2D_AUTO 0            /* XBOX_D3D8_2D_AUTO */
+#define TK_2D_EDGE 6            /* XBOX_D3D8_2D_EDGE */
+
+void sub_0009C9A0(void)
+{
+    xbox_D3D8SetTwoDPlacement(TK_2D_EDGE, 0x0009C9A0u);
+    sub_0009C9A0_gen();
+    xbox_D3D8SetTwoDPlacement(TK_2D_AUTO, 0);
 }
