@@ -54,6 +54,7 @@ if(TUROK_BUILD_GAME)
     add_executable(${PROJECT_NAME} WIN32
         src/main.c
         src/recomp_manual.c
+        src/gpu_translator.c
         ${RECOMP_GEN_SOURCES}
     )
     target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp
@@ -65,6 +66,12 @@ if(TUROK_BUILD_GAME)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen
         ${XBOXRECOMP_DIR}/include
+        # src/gpu_translator.c: the runtime's D3D8 device, the PGRAPH
+        # translator and the shared key table.
+        ${XBOXRECOMP_DIR}/src/d3d
+        ${XBOXRECOMP_DIR}/src/nv2a
+        ${XBOXRECOMP_DIR}/src/input
+        ${XBOXRECOMP_DIR}/src/platform
     )
     target_compile_definitions(${PROJECT_NAME} PRIVATE TUROK_VERSION=\"${PROJECT_VERSION}\")
     if(MSVC)

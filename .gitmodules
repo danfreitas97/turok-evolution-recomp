@@ -1,4 +1,4 @@
 [submodule "tools/xboxrecomp"]
 	path = tools/xboxrecomp
 	url = https://github.com/danfreitas97/xboxrecomp.git
-	branch = turok/v0.17
+	branch = turok/gpu

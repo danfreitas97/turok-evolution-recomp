@@ -89,10 +89,18 @@ scripts/               extract -> analyze -> recomp -> build -> run
 - [x] DirectSound init (emulated APU answers the DSP mailbox)
 - [x] Loads its text and data from the `supertree*.tre` archives and starts the
       intro movie (`data\video\intro.xmv`), ~35 s after launch
-- [ ] Intro movie visible: the title decodes it on the GPU (render-to-texture),
-      which the CPU rasteriser draws black
-- [ ] Render on the host GPU when there is one, CPU rasteriser as the fallback
-- [ ] First frame on screen
+- [x] Render on the host GPU (Direct3D 11, `src/gpu_translator.c`) when there is
+      one, CPU rasteriser as the fallback (`TUROK_RENDERER=cpu` forces it).
+      The toolkit is FFNY Online's fork for now (submodule branch `turok/gpu`),
+      which has the GPU path; the generic parts go upstream as they settle.
+- [x] First frames on screen: the Acclaim logo and the legal screen
+- [ ] Anti-aliased frames are shown zoomed 2x (top-left quarter): Turok draws
+      each scene into a 1280x480 supersampled surface and filters it to the
+      640x480 front buffer, which the translator does not resolve right yet
+- [ ] Intro movie visible
+- [ ] Audio: emulated APU, clean since the 64 ms XAudio2 queue; the DSP is
+      still a passthrough stub (no effects)
+- [ ] Linux/macOS on the GPU (the fork's Vulkan device needs a host window)
 - [ ] Menus, audio, input
 - [ ] In-game
 

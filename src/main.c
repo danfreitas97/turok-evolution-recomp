@@ -84,6 +84,35 @@ extern ptrdiff_t g_xbox_mem_offset;
 static char g_game_dir[MAX_PATH];
 static char g_xbe_path[MAX_PATH];
 
+/* ── Renderer: host GPU when there is one, CPU otherwise ────────
+ *
+ * src/gpu_translator.c stands up a Direct3D 11 device; with it the pushbuffer
+ * executor forwards every draw to the GPU translator (RECOMP_PB_D3D11).
+ * Without a usable GPU, or with TUROK_RENDERER=cpu, the executor rasterises
+ * on the CPU and the toolkit's framebuffer window shows the result
+ * (RECOMP_FB_WINDOW). Both variables are decided here, before the title runs:
+ * the executor and the window read them once, on first use. */
+int  gpu_translator_init(void);
+void gpu_translator_frame_end(void);
+#include "nv2a_pgraph_d3d11.h"
+
+static void choose_renderer(void)
+{
+    if (gpu_translator_init()) {
+        _putenv_s("RECOMP_PB_D3D11", "1");
+        _putenv_s("RECOMP_FB_WINDOW", "");       /* empty removes it */
+#ifdef RECOMP_PGRAPH_FRAME_END_CALLBACK
+        pgraph_d3d11_set_frame_end_callback(gpu_translator_frame_end);
+#endif
+        printf("Renderer: GPU (Direct3D 11)\n");
+    } else {
+        _putenv_s("RECOMP_PB_D3D11", "");
+        if (!getenv("RECOMP_FB_WINDOW"))
+            _putenv_s("RECOMP_FB_WINDOW", "1");
+        printf("Renderer: CPU\n");
+    }
+}
+
 /* ── Forward declarations ──────────────────────────────────── */
 
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
@@ -318,10 +347,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * the APU nothing answers and boot stops there. */
     if (!getenv("RECOMP_AC97_READY"))
         _putenv_s("RECOMP_AC97_READY", "1");
-    /* RECOMP_FB_WINDOW: the window that shows the guest framebuffer. Without
-     * it the title runs with nothing on screen. */
-    if (!getenv("RECOMP_FB_WINDOW"))
-        _putenv_s("RECOMP_FB_WINDOW", "1");
+    /* RECOMP_VBLANK: the vertical-blank interrupt. XDK D3D waits on events
+     * its GPU interrupt routine (0x0019D390) signals; without vblanks the
+     * first such wait in D3D init (event at 0x001A44E4) never returns. */
+    if (!getenv("RECOMP_VBLANK"))
+        _putenv_s("RECOMP_VBLANK", "1");
+    /* Audio, as FFNY Online runs the same emulated APU: six 512-sample
+     * XAudio2 buffers (64 ms) instead of four, which clicked whenever a
+     * present waited on the display, and 3D voices without HRTF until a
+     * listening comparison says otherwise. */
+    if (!getenv("RECOMP_AUDIO_BUF_COUNT"))
+        _putenv_s("RECOMP_AUDIO_BUF_COUNT", "6");
+    if (!getenv("RECOMP_APU_HRTF"))
+        _putenv_s("RECOMP_APU_HRTF", "0");
+    /* The renderer (GPU or CPU) is chosen after the memory layout is up; see
+     * choose_renderer() below. */
     {
         const char *d = getenv("TUROK_GAME_DIR");
         snprintf(g_game_dir, sizeof g_game_dir, "%s",
@@ -395,6 +435,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         CreateDirectoryA(save_dir, NULL);
         xbox_path_init(g_game_dir, save_dir);
     }
+
+    choose_renderer();
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
