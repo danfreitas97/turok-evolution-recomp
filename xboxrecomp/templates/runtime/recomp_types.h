@@ -1,0 +1,1352 @@
+/**
+ * Xbox Static Recompilation - Runtime Type Definitions
+ *
+ * Type definitions and helper macros used by mechanically translated
+ * x86 -> C code. Each original x86 function is translated to a C
+ * function that uses these types and macros.
+ *
+ * This is a reusable template for ANY Xbox game. Game-specific
+ * customization should go in separate headers.
+ *
+ * Memory model:
+ *   Xbox data sections are mapped to their original VAs via
+ *   CreateFileMapping + MapViewOfFileEx (see xbox_memory.h).
+ *   Recompiled code accesses globals via pointer casts, e.g.:
+ *     *(uint32_t*)0x003B2360
+ *
+ * Register model:
+ *   Volatile registers (eax, ecx, edx, esp) are global variables,
+ *   matching real x86 behavior where these registers are shared
+ *   across all code. This enables correct argument passing via the
+ *   simulated stack and return value communication via eax.
+ *
+ *   Callee-saved registers (ebx, esi, edi) are also global because
+ *   callers pass implicit parameters through them (e.g. 'this' via
+ *   esi in thiscall). The callee-save contract is enforced by
+ *   PUSH32/POP32 instructions in the generated code, not by C local
+ *   variable scoping.
+ *
+ *   ebp is NOT global - it stays local in each function because many
+ *   FPO (Frame Pointer Omission) functions use it as scratch without
+ *   save/restore. For SEH functions, g_seh_ebp bridges the gap.
+ *
+ * Calling convention:
+ *   All translated functions are void(void). Arguments are passed
+ *   on the simulated Xbox stack (via push instructions before call).
+ *   Return values are communicated through g_eax.
+ *   The call instruction pushes the real guest return address (the VA of
+ *   the instruction after the call); ret discards it with esp += 4.
+ *   The value is never used to transfer control -- control flow is C
+ *   call/return -- but it must be correct because guest code reads it
+ *   (__SEH_prolog's scope table, _alloca probes, "mov eax, [esp]").
+ */
+
+#ifndef RECOMP_TYPES_H
+#define RECOMP_TYPES_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+/* math.h is load-bearing, and its absence was invisible.
+ *
+ * The lifter emits sqrt() and fabs() for fsqrt/fabs -- 146 of them in one of
+ * Halo's nine chunks alone -- and now sin/cos/tan/atan2/log2/exp2/fmod for the
+ * x87 transcendentals. With no declaration in scope, C89 implicit declaration
+ * makes every one of them return `int`: the caller reads EAX instead of XMM0 and
+ * gets garbage, then converts that garbage to double. Vector normalisation is
+ * 1/sqrt(x), so this corrupts every matrix the title builds.
+ *
+ * Nothing reported it because generated code is compiled with /w (see the game
+ * CMakeLists) -- MSVC's C4013 was emitted and discarded. Same failure as the
+ * missing stdlib.h in kernel_bridge.c, in a hotter path. Generated code is
+ * still built with warnings off (xboxrecomp_generated_source_options in the
+ * top-level CMakeLists), but with implicit declaration kept as an error. */
+#include <math.h>
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
+/* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
+#if !defined(_MSC_VER) && !defined(__forceinline)
+#define __forceinline inline __attribute__((always_inline))
+#endif
+/* What these headers use: not __forceinline itself, which MinGW's headers
+ * define as extern inline, and so not something a static function can be. */
+#if defined(_MSC_VER)
+#define RECOMP_FORCEINLINE __forceinline
+#else
+#define RECOMP_FORCEINLINE inline __attribute__((always_inline))
+#endif
+
+/* Guest debug output: INT 2D, the Xbox kernel debug trap.
+ *
+ * eax selects the service, ecx carries its argument. Service 1 prints the
+ * ANSI_STRING ecx points at -- what OutputDebugStringA compiles to. The int3
+ * that always follows is the slide byte the kernel steps over, so the lifter
+ * emits nothing for it; lifting it to __debugbreak() terminated the process
+ * with STATUS_BREAKPOINT the first time a title tried to print. */
+void recomp_debug_service(uint32_t service, uint32_t arg_va);
+
+/* An int3 that lifted code actually executed: almost always an un-unwound
+ * C++ throw. Silent before; see docs/technical/cpp-exceptions.md. */
+void recomp_int3_reached(uint32_t va);
+
+/* A C++ throw, at _CxxThrowException's entry. Reported with the type that was
+ * thrown; caught, when a lifted frame catches it (recomp_cxx.h). Returns only
+ * when nothing can catch it. See docs/technical/cpp-exceptions.md. */
+void recomp_cxx_throw(uint32_t object_va, uint32_t throwinfo_va);
+#include "recomp_cxx.h"
+
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
+ * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
+#if !defined(_MSC_VER) && !defined(__debugbreak)
+#define __debugbreak() __builtin_trap()
+#endif
+
+/* ================================================================
+ * Memory offset
+ * ================================================================ */
+
+/**
+ * Memory offset from Xbox VA to actual mapped address.
+ * When Xbox memory is mapped at the original address (0x00010000),
+ * this is 0 and the MEM macros are simple identity casts.
+ * When mapped elsewhere, this adjusts all memory accesses.
+ *
+ * Set once during memory initialization, then read-only.
+ */
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* Bounds of the title's executable sections, filled in by
+ * xbox_MemoryLayoutInit from the XBE's own section table. Zero means "not
+ * loaded yet", which RECOMP_ICALL_IS_CODE treats as allow.
+ *
+ * These replace a hardcoded 0x00400000 cutoff that was only ever right for one
+ * title -- see the comment where they are defined in xbox_memory_layout.c. */
+/* --force-return: read once at startup, so the check at each forced ret is a
+ * load rather than a getenv. Zero unless RECOMP_FORCE_RETURN is set, which is
+ * what lets a build carrying forced functions behave normally by default. */
+extern int g_force_return;
+
+extern uint32_t g_xbox_code_lo;
+extern uint32_t g_xbox_code_hi;
+
+/* Is this indirect-call target plausibly code?
+ *
+ * Synthetic kernel thunks live at 0xFE0000xx and are dispatched by
+ * recomp_lookup_kernel, so they are always allowed. Everything else has to lie
+ * inside an executable section of the loaded title. A target that fails this is
+ * a garbage pointer that reached a call site, and calling it would be worse
+ * than dropping it. */
+#define RECOMP_ICALL_IS_CODE(_va) \
+    ((_va) >= 0xFE000000u || g_xbox_code_hi == 0u || \
+     ((_va) >= g_xbox_code_lo && (_va) < g_xbox_code_hi))
+
+/* ================================================================
+ * Global registers
+ * ================================================================ */
+
+/**
+ * Volatile x86 registers (caller-saved):
+ *   eax - return values, general accumulator
+ *   ecx - 'this' pointer for thiscall, loop counter
+ *   edx - high dword of multiply/divide, general
+ *   esp - stack pointer (initialized to top of Xbox stack)
+ *
+ * Callee-saved x86 registers (also global):
+ *   ebx, esi, edi - global because callers pass implicit parameters
+ *   through them. The callee-save contract is enforced by generated
+ *   PUSH32/POP32 instructions.
+ *
+ * NOT global: ebp - stays local in each function because FPO
+ * functions use it as scratch. For SEH, g_seh_ebp bridges the gap.
+ */
+/* Per-thread register state.
+ *
+ * These started as plain globals, which works exactly as long as one thread
+ * runs recompiled code. Halo is the first title to create real workers (its
+ * cache/file loader), and the runtime papered over that by running every worker
+ * synchronously inside PsCreateSystemThreadEx -- so a worker that blocks
+ * waiting for work never returns and startup deadlocks.
+ *
+ * On hardware each thread has its own register set, so model it that way.
+ * Thread-local costs an indirection per access; a deadlock costs the title. */
+#if defined(_MSC_VER)
+#  define RECOMP_TLS __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RECOMP_TLS __thread
+#else
+#  define RECOMP_TLS _Thread_local
+#endif
+
+/* The registers themselves -- g_eax..g_edi, g_esp, g_ebp, g_seh_ebp,
+ * g_fs_base, g_df, the x87 stack and status, g_icall_saved_esp and
+ * g_icall_dispatch_form -- are fields of one thread-local struct, g_cpu, so
+ * a lifted function reaches all of them through one thread-local base
+ * (on Mach-O, one _tlv_get_addr call instead of one per register). The
+ * names stay as macros, so generated code is unchanged. recomp_cpu.h is
+ * copied into gen/ beside this file; see it for the layout rules.
+ *
+ * x87 stack: per-thread for the same reason the integer registers are:
+ * arguments are passed in st(0)/st(1) across call boundaries. */
+#include "recomp_cpu.h"
+
+/**
+ * SEH frame pointer bridge.
+ *
+ * __SEH_prolog sets up ebp for the caller, but since ebp is a local
+ * variable in each function, the caller can't see the prolog's change.
+ * The prolog writes g_seh_ebp, and the caller reads it after the call.
+ * Similarly, __SEH_epilog reads g_seh_ebp at entry and writes it at exit.
+ */
+/* Linear base of the fs segment: where the fake TIB lives. Generated code
+ * adds this to every fs-relative address, so page zero stays unmapped and a
+ * null dereference faults instead of hitting the TIB. Must match
+ * XBOX_FS_BASE in src/kernel/xbox_memory_layout.h.
+ *
+ * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
+ * reaches the CRT's per-thread data, so a single shared base makes every
+ * guest thread the same thread as far as the CRT is concerned.
+ * (g_fs_base and g_seh_ebp are fields of g_cpu, recomp_cpu.h.) */
+#define XBOX_FS_BASE g_fs_base
+
+/* ---- non-local jumps (setjmp / longjmp) --------------------------------
+ *
+ * A recompiled function is a real C function, so restoring the guest esp is
+ * only half of a longjmp: the abandoned frames are still on the native stack,
+ * and control returns into them once the resume point finishes. Pairing each
+ * guest jmp_buf with a native one -- taken at the setjmp call site, the only
+ * place a native setjmp is valid -- makes the guest jump a native jump, so the
+ * frames actually unwind.
+ *
+ * recomp_setjmp_slot() returns the native buffer for a guest jmp_buf address,
+ * allocating one on first use. recomp_guest_longjmp() restores the guest
+ * registers the CRT's longjmp would and jumps; it returns 0, without jumping,
+ * for a buffer that has no native counterpart, leaving the caller to fall back
+ * to the guest's own longjmp.
+ */
+/* Atomic read-modify-write, for the lock-prefixed instructions.
+ *
+ * "lock xadd" and "lock cmpxchg" are what InterlockedIncrement and
+ * InterlockedCompareExchange compile to, so they carry a title's reference
+ * counts and its lock-free lists. They used to lift to a TODO comment, which
+ * meant a refcount that never moved and a compare-and-swap that never swapped
+ * -- harmless while every guest thread ran synchronously, and not once the
+ * runtime began spawning real ones.
+ *
+ * Genuinely atomic, not merely correct in isolation: the guest's own threads
+ * now run on real host threads, so a read-modify-write that races is exactly
+ * the bug these instructions exist to prevent.
+ */
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)_InterlockedCompareExchange((volatile long *)(p),                                            (long)(val), (long)(cmp)))
+#else
+#define RECOMP_ATOMIC_ADD32(p, v)     ((uint32_t)__sync_fetch_and_add((volatile uint32_t *)(p), (uint32_t)(v)))
+#define RECOMP_ATOMIC_CAS32(p, cmp, val)     ((uint32_t)__sync_val_compare_and_swap((volatile uint32_t *)(p),                                            (uint32_t)(cmp), (uint32_t)(val)))
+#endif
+
+/* The rest of the locked family, and xchg with memory (locked whether or not
+ * it says so): lock add/sub/and/or/xor/inc/dec/not/neg on a byte, word or
+ * dword. They used to reach RECOMP_UNIMPL and do nothing at all -- a
+ * `lock inc [refcount]` never counted -- on every host.
+ *
+ * The lifter emits a compare-and-swap loop over the operation, then derives
+ * the flags from the old and new values exactly as the unlocked form does.
+ * RECOMP_ATOMIC_CASV<n>(p, &expected, desired): 1 if *p held expected and now
+ * holds desired, else 0 with expected updated to what *p held.
+ * RECOMP_ATOMIC_XCHG<n>(p, v): store v, return what was there.
+ *
+ * AArch64 note: these are LSE atomics, which need natural alignment, or with
+ * FEAT_LSE2 (every Apple M-series) at least to stay inside a 16-byte granule.
+ * A guest locked op that straddles one faults as SIGBUS at the lifted
+ * instruction. x86 has no such limit (a split lock). None has been seen. */
+#if defined(_MSC_VER)
+static RECOMP_FORCEINLINE int RECOMP_ATOMIC_CASV32(volatile uint32_t *p, uint32_t *e, uint32_t d)
+{
+    uint32_t o = (uint32_t)_InterlockedCompareExchange((volatile long *)p, (long)d, (long)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+static RECOMP_FORCEINLINE int RECOMP_ATOMIC_CASV16(volatile uint16_t *p, uint16_t *e, uint16_t d)
+{
+    uint16_t o = (uint16_t)_InterlockedCompareExchange16((volatile short *)p, (short)d, (short)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+static RECOMP_FORCEINLINE int RECOMP_ATOMIC_CASV8(volatile uint8_t *p, uint8_t *e, uint8_t d)
+{
+    uint8_t o = (uint8_t)_InterlockedCompareExchange8((volatile char *)p, (char)d, (char)*e);
+    if (o == *e) return 1;
+    *e = o;
+    return 0;
+}
+#define RECOMP_ATOMIC_XCHG32(p, v) ((uint32_t)_InterlockedExchange((volatile long *)(p), (long)(v)))
+#define RECOMP_ATOMIC_XCHG16(p, v) ((uint16_t)_InterlockedExchange16((volatile short *)(p), (short)(v)))
+#define RECOMP_ATOMIC_XCHG8(p, v)  ((uint8_t)_InterlockedExchange8((volatile char *)(p), (char)(v)))
+#else
+#define RECOMP_ATOMIC_CASV32(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint32_t *)(p), (e), (uint32_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_CASV16(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint16_t *)(p), (e), (uint16_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_CASV8(p, e, d) \
+    __atomic_compare_exchange_n((volatile uint8_t *)(p), (e), (uint8_t)(d), 0, \
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG32(p, v) \
+    __atomic_exchange_n((volatile uint32_t *)(p), (uint32_t)(v), __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG16(p, v) \
+    __atomic_exchange_n((volatile uint16_t *)(p), (uint16_t)(v), __ATOMIC_SEQ_CST)
+#define RECOMP_ATOMIC_XCHG8(p, v) \
+    __atomic_exchange_n((volatile uint8_t *)(p), (uint8_t)(v), __ATOMIC_SEQ_CST)
+#endif
+
+/* Integer division, as x86 does it.
+ *
+ * x86 raises #DE for a zero divisor, and for a quotient that does not fit;
+ * AArch64's sdiv/udiv return 0 for the first and C leaves INT64_MIN / -1
+ * undefined. The lifted division is 64-by-32 in C, so on an x86 host the
+ * hardware still traps exactly where Windows has always trapped -- a zero
+ * divisor (EXCEPTION_INT_DIVIDE_BY_ZERO), and edx:eax = 0x8000000000000000
+ * over -1 (EXCEPTION_INT_OVERFLOW) -- and these checks compile to nothing
+ * there. Elsewhere they raise the same two faults through the runtime
+ * (recomp_int_divide_fault -> recomp_fault_raise), so a title that divides by
+ * zero dies the same observable way on every host.
+ *
+ * A 32-bit quotient that overflows is NOT trapped, on any host: Windows has
+ * never trapped it (the division is done in 64 bits and truncated), though
+ * the console would. That is a decision, not an oversight. */
+#if defined(__GNUC__) || defined(__clang__)
+#define RECOMP_UNLIKELY(c) __builtin_expect(!!(c), 0)
+#else
+#define RECOMP_UNLIKELY(c) (c)
+#endif
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+#define RECOMP_DIV_CHECK(d)        ((void)0)
+#define RECOMP_IDIV_CHECK(n, d)    ((void)0)
+#else
+void recomp_int_divide_fault(uint32_t code);
+#define RECOMP_DIV_CHECK(d) do {                                         \
+        if (RECOMP_UNLIKELY((d) == 0))                                    \
+            recomp_int_divide_fault(0xC0000094u);                        \
+    } while (0)
+#define RECOMP_IDIV_CHECK(n, d) do {                                     \
+        if (RECOMP_UNLIKELY((d) == 0))                                    \
+            recomp_int_divide_fault(0xC0000094u);                        \
+        else if (RECOMP_UNLIKELY((d) == -1 && (n) == INT64_MIN))           \
+            recomp_int_divide_fault(0xC0000095u);                        \
+    } while (0)
+#endif
+
+/* A loop's back edge: the place a guest thread lets another one run.
+ *
+ * With the guest lock on (the default on ARM hosts) only one guest thread is
+ * in lifted code at a time, and a thread lets go only at a kernel call -- so
+ * one that spins in lifted code waiting for another guest thread would wait
+ * forever, where the console's scheduler would end its quantum. The
+ * translator puts this at every loop header. It reads one plain global, the
+ * number of threads waiting for the lock: zero (always, with the lock off) is
+ * a load and a predicted branch; non-zero calls the runtime, which hands the
+ * lock over if this thread has held it for its quantum (xbox_memory_layout.c,
+ * RECOMP_GUEST_QUANTUM_US). Volatile, so the compiler re-reads it on every
+ * iteration even of a loop that touches no other memory. */
+extern volatile int32_t g_guest_lock_waiters;
+void recomp_guest_backedge_yield(void);
+#ifdef RECOMP_NO_BACKEDGE
+/* For measuring what the check costs; a build without it can deadlock a
+ * title with the guest lock on. */
+#define RECOMP_BACKEDGE() ((void)0)
+#else
+#define RECOMP_BACKEDGE() do {                                           \
+        if (RECOMP_UNLIKELY(g_guest_lock_waiters))                       \
+            recomp_guest_backedge_yield();                               \
+    } while (0)
+#endif
+
+#include <setjmp.h>
+jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
+int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+/* A guest longjmp to a buffer armed on another native stack (host fibers):
+ * the handler switches to that stack and jumps there; it does not return. */
+typedef void (*recomp_foreign_longjmp_fn)(jmp_buf *target, int value,
+                                          uintptr_t armed_stack);
+void recomp_set_foreign_longjmp(recomp_foreign_longjmp_fn fn);
+/* g_ebp is a field of g_cpu (recomp_cpu.h). */
+
+/* EFLAGS.DF, and the signed step the string instructions take because of it.
+ *
+ * `cld`/`std` used to lift to a comment and every string instruction stepped
+ * forwards regardless. That is right almost everywhere -- DF is 0 by ABI and
+ * the compiler restores it -- but MSVC's strrchr is `std; repne scasb` from
+ * the terminator backwards, so it scanned forwards off the end of the string
+ * and returned a pointer into whatever followed. The Xbox Dashboard uses it to
+ * split "y:\default.xip" into a mount path; with strrchr wrong the archive
+ * registered itself under its own full filename, no resource in it could ever
+ * be found by name, and the dashboard rebooted rather than showing a UI.
+ * memmove's overlapping case is the same instruction and the same bug.
+ */
+/* g_df is a field of g_cpu (recomp_cpu.h). */
+#define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
+
+/* x87 control and status. Thread-local for the same reason the x87 stack
+   above is: one guest routine can lift to several C functions, so a compare
+   and the FNSTSW that reads it can land in different bodies, and the control
+   word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
+/* g_fp_control_word, g_fp_cmp and g_fp_cc are fields of g_cpu (recomp_cpu.h). */
+/* x87 precision control (control word bits 8-9). The stack is double-backed,
+ * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
+ * Xbox runs with -- rounds every arithmetic result to float. A title that
+ * compares a freshly computed value against the same value stored as a float
+ * relies on that: Burnout 3's sorted draw list re-inserts a node by walking
+ * while `v > next` / `v < prev`, and with v left at double precision it sits
+ * between its own stored copy and a neighbour and walks back and forth
+ * forever, which froze every race at the start line.
+ *
+ * PC narrows the significand only; the exponent keeps the register's range.
+ * So a plain (float) cast is right only inside float's range -- outside it,
+ * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
+ * tiny one to 0, where the x87 carries on. Those go the long way. */
+static inline double recomp_fp_round24(double x) {
+    double ax = fabs(x);
+    int e;
+    if ((ax <= 3.4028234663852886e38 && ax >= 1.1754943508222875e-38) || ax == 0.0
+        || x != x || ax == INFINITY)
+        return (double)(float)x;
+    x = frexp(x, &e);                      /* |x| in [0.5, 1): float-exact range */
+    return ldexp((double)(float)x, e);
+}
+#define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
+#define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+/* Values in the existing double-backed stack are all representable as normal
+ * x87 extended values, including binary64 subnormals. Empty stack tags and
+ * unsupported extended encodings are not represented by this stack model. */
+static inline uint16_t recomp_fxam(double value) {
+    return (uint16_t)((signbit(value) ? 0x0200u : 0u) |
+        (isnan(value) ? 0x0100u : isinf(value) ? 0x0500u :
+         value == 0.0 ? 0x4000u : 0x0400u));
+}
+
+/* Result of an x87 compare, in the shape the status word wants:
+ *   -1 less, 0 equal, 1 greater, 2 unordered (either operand is NaN).
+ * The unordered case is not a curiosity: `fucompp` of a value with itself
+ * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
+ * and collapsing it to "equal" answers no every time. */
+#define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
+/* x87 rounding to an integral value under the guest RC bits (control word
+ * bits 10-11: 0 nearest-even, 1 down, 2 up, 3 toward zero). FRNDINT rounds
+ * this way, and so does FIST before its store; neither may follow the HOST's
+ * rounding mode, which the guest's fldcw never reaches. MSVC's CRT floor() and
+ * ceil() are `fldcw RC=down/up` (via _ctrlfp) around _frnd, a bare frndint,
+ * so a frndint lifted as rint() made both of them round to nearest.
+ * NaN, the infinities and values already integral come back unchanged, and a
+ * zero result keeps the operand's sign, as FRNDINT's does. */
+static inline double recomp_frndint(double value, uint16_t control) {
+    double rounded;
+    if (!isfinite(value)) return value;
+    switch((control>>10)&3) {
+    case 1: rounded=floor(value); break;
+    case 2: rounded=ceil(value); break;
+    case 3: rounded=trunc(value); break;
+    default: {
+        double lo=floor(value), fraction=value-lo;
+        rounded=lo;
+        if(fraction>0.5 || (fraction==0.5 && fmod(lo,2.0)!=0.0)) rounded=lo+1.0;
+        break;
+    }
+    }
+    return rounded == 0.0 ? copysign(0.0, value) : rounded;
+}
+/* x87 integer stores use the guest RC bits, independently of host rounding.
+ * Masked invalid conversions store the signed integer-indefinite value. */
+static inline int64_t recomp_fist(double value, uint16_t control, unsigned bits) {
+    double rounded = recomp_frndint(value, control);
+    double limit=ldexp(1.0,(int)bits-1);
+    if(!isfinite(rounded) || rounded < -limit || rounded >= limit)
+        return bits==64?INT64_MIN:-(INT64_C(1)<<(bits-1));
+    return (int64_t)rounded;
+}
+
+/* fld/fstp tbyte: a 64-bit significand with an explicit integer bit, a 15-bit
+ * exponent biased by 16383, the sign on top. The stack is double, so a load
+ * rounds to 53 bits (an 80-bit denormal is far below double's range and reads
+ * as 0) and a store is exact. */
+static inline double recomp_f80_load(uint64_t mant, uint16_t se) {
+    int e = se & 0x7fff;
+    double v = e == 0x7fff ? ((mant << 1) ? NAN : INFINITY)
+                           : ldexp((double)mant, e - 16383 - 63);
+    return (se & 0x8000u) ? -v : v;
+}
+static inline uint16_t recomp_f80_store(double v, uint64_t *mant) {
+    union { double d; uint64_t u; } bits;
+    uint16_t sign = signbit(v) ? 0x8000u : 0u;
+    int e;
+    bits.d = v;
+    if (v != v) { *mant = 0x8000000000000000ull | (bits.u << 11); return sign | 0x7fffu; }
+    if (isinf(v)) { *mant = 0x8000000000000000ull; return sign | 0x7fffu; }
+    if (v == 0.0) { *mant = 0; return sign; }
+    v = frexp(fabs(v), &e);
+    *mant = (uint64_t)(int64_t)ldexp(v, 63) << 1;
+    return (uint16_t)(sign | (e + 16382));
+}
+
+/* ================================================================
+ * ICALL trace ring buffer (for debugging indirect calls)
+ * ================================================================ */
+
+/** Size of the ring buffer (must be power of 2). */
+#define ICALL_TRACE_SIZE 16
+
+/** Ring buffer of recent indirect call target VAs. */
+extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+
+/** Current write index into the ring buffer. */
+extern volatile uint32_t g_icall_trace_idx;
+
+/** Total count of indirect calls executed. */
+extern volatile uint64_t g_icall_count;
+
+/**
+ * Called when an indirect call target cannot be resolved.
+ * Implement this in your game-specific code to log diagnostics.
+ * The va parameter is the Xbox VA that failed to resolve.
+ */
+/* The guest esp at the moment an indirect call was refused, so the log can
+ * name the call site. The top of the guest stack is a return address in
+ * every form: the one the call site just pushed for RECOMP_ICALL and
+ * RECOMP_ICALL_SAFE, and the current frame's own for RECOMP_ITAIL, which
+ * pushes nothing. Set here rather than passed, so a title whose generated
+ * header predates this still compiles and simply reports no callers. */
+/* g_icall_saved_esp: a field of g_cpu (recomp_cpu.h). */
+/* Which dispatch form was refused: 0 unknown, 1 call, 2 jump.
+ *
+ * The two mean different things and want different next steps. A call to
+ * an address nothing identified is a discovery gap, answered by seeding;
+ * a jump to one is usually the guest doing its own control flow, which no
+ * amount of seeding fixes. Saying "Failed to resolve" for both sent a
+ * Mortal Kombat coroutine three rounds through the seeding tool.
+ *
+ * Zero rather than a boolean because a title whose generated header
+ * predates this never assigns it, and a two-valued flag would then read
+ * as "call" for every refusal including the jumps -- the exact wrong
+ * answer this exists to stop giving. Unknown is reported as unknown. */
+/* g_icall_dispatch_form: a field of g_cpu (recomp_cpu.h). */
+
+void recomp_icall_fail_log(uint32_t va);
+
+/* Report an indirect call whose target is not code (a null or wild
+ * function pointer). Rate-limited per address by the implementation,
+ * because these usually arrive inside a loop -- which is exactly why
+ * they must be reported: silently skipping one turns a diagnosable null
+ * vtable call into an unexplained hang. */
+void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp);
+
+/* Report a direct call or jump into an address that was never recompiled --
+ * the generated stub in recomp_stubs_unresolved.c. The stub keeps esp
+ * balanced and does nothing else, so whatever the guest code there would have
+ * done is skipped. Once per address, from the runtime, so every title gets it
+ * without touching its recomp_manual.c.
+ *
+ * Burnout 2's sound manager constructor was one of these: reached only by a
+ * static initialiser's tail jump, never discovered, and so never run. A field
+ * it should have set stayed null, and the game crashed a minute later in an
+ * unrelated-looking Pause. */
+void recomp_stub_missing(uint32_t va);
+
+/* Indirect-branch target feedback. The ring buffer above is crash forensics --
+ * 16 entries, overwritten constantly. This is a durable, deduplicated record of
+ * every target the title ever reached, for feeding back into the next codegen
+ * run (tools/recomp/icall_feedback.py).
+ *
+ * The header is pulled in only when the feature is on, so a default build needs
+ * neither the file nor src/kernel on its include path. Disabled,
+ * RECOMP_ICALL_OBSERVE discards its arguments without expanding them, so the
+ * RECOMP_ICALL_SEEN_* constants need not exist either. */
+#ifdef RECOMP_ICALL_FEEDBACK
+#include "recomp_icall_feedback.h"
+#else
+#define RECOMP_ICALL_OBSERVE(va, flags) ((void)0)
+#define RECOMP_ICALL_OBSERVE_SITE(site, va) ((void)0)
+#endif
+
+/**
+ * Function entry trace, emitted only for addresses passed to
+ * tools.recomp --trace-functions. Bring-up is largely "which of these
+ * init calls does it not come back from", and answering that by
+ * overriding a function loses the body you were trying to observe.
+ */
+/* The guest's time source.
+ *
+ * Xbox's QueryPerformanceCounter is a bare rdtsc and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant, so the guest
+ * divides this by 733,333,333 to get seconds. Returning the host TSC would
+ * make that division wrong by the ratio of the two clocks; the runtime scales
+ * to the console's rate instead. */
+uint64_t xbox_ReadTimeStampCounter(void);
+
+/* cpuid, answered as the Xbox's Pentium III: leaf in eax, subleaf in ecx,
+ * out[] = eax, ebx, ecx, edx. And the EFLAGS word pushfd pushes / popfd
+ * restores: IF and DF, plus the AC and ID bits a program set (the "does this
+ * CPU have cpuid" test toggles ID). xbox_memory_layout.c. */
+void recomp_cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+uint32_t recomp_eflags_push(void);
+void recomp_eflags_pop(uint32_t eflags);
+
+void recomp_trace_enter(const char *name, uint32_t va);
+#define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
+void recomp_trace_exit(const char *name, uint32_t va);
+#define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
+void recomp_trace_esp(const char *name, const char *tag);
+#define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
+
+
+/* ================================================================
+ * Memory access helpers
+ * ================================================================ */
+
+/**
+ * Translate an Xbox VA to an actual pointer.
+ * Mask to 32-bit first: Xbox addresses are 32-bit and arithmetic
+ * in the recompiled code can overflow. Without the mask, a 64-bit
+ * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
+ * our mapping and causing access violations.
+ */
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+
+/** Read/write N bytes at a flat Xbox memory address. */
+#define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
+#define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
+#define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+#define MEM64(addr)  (*(volatile uint64_t *)XBOX_PTR(addr))
+
+/** Signed memory reads. */
+#define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
+#define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
+#define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
+#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+
+/** Float/double memory access. */
+#define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+#define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+
+/* fnsave / frstor: the x87 state image. The lifter left both as comments, so
+ * a routine that saves the FPU around its own use of it -- a context switch,
+ * a library that has to preserve the caller's stack -- saved nothing and
+ * restored nothing, and fnsave's reset never happened either: the caller's
+ * registers stayed on the stack, and TOP drifted by however many it held.
+ *
+ * The image is the protected-mode one: a 28-byte environment (14 with an
+ * operand-size prefix, short_env) of seven fields, then ST(0)..ST(7) as
+ * 80-bit values. What the double-backed stack models is written and read
+ * back: the control word, TOP and the condition codes in the status word,
+ * and the eight registers. The tag word, the exception bits and the
+ * instruction and operand pointers are not tracked and are saved as zero.
+ * fnsave then initialises the FPU, as fninit does. */
+static inline void recomp_fnsave(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    for (i = 0; i < env; ++i) MEM8(address + i) = 0;
+    MEM16(address) = g_fp_control_word;
+    MEM16(address + stride) = (uint16_t)(((g_fp_top & 7u) << 11) | (g_fp_cc & 0x4700u));
+    for (i = 0; i < 8; ++i) {
+        uint64_t mant;
+        uint16_t se = recomp_f80_store(g_fp_stack[(g_fp_top + i) & 7u], &mant);
+        uint32_t slot = address + env + 10u * i;
+        MEM32(slot) = (uint32_t)mant;
+        MEM32(slot + 4) = (uint32_t)(mant >> 32);
+        MEM16(slot + 8) = se;
+    }
+    g_fp_control_word = 0x037Fu;
+    g_fp_top = 0;
+    g_fp_cc = 0;
+    g_fp_cmp = 0;
+}
+
+static inline void recomp_frstor(uint32_t address, int short_env) {
+    unsigned stride = short_env ? 2u : 4u;
+    unsigned env = 7u * stride;
+    unsigned i;
+    uint16_t status = MEM16(address + stride);
+    g_fp_control_word = MEM16(address);
+    g_fp_top = (status >> 11) & 7u;
+    g_fp_cc = status & 0x4700u;
+    /* The last compare, as the fcom family leaves it, from C3/C2/C0. */
+    g_fp_cmp = (g_fp_cc & 0x0400u) ? 2 : (g_fp_cc & 0x4000u) ? 0
+             : (g_fp_cc & 0x0100u) ? -1 : 1;
+    for (i = 0; i < 8; ++i) {
+        uint32_t slot = address + env + 10u * i;
+        uint64_t mant = ((uint64_t)MEM32(slot + 4) << 32) | MEM32(slot);
+        g_fp_stack[(g_fp_top + i) & 7u] = recomp_f80_load(mant, MEM16(slot + 8));
+    }
+}
+
+/* ================================================================
+ * Flag computation helpers
+ *
+ * These macros compute x86 flags for conditional branches.
+ * Used by the lifter's pattern-matching output:
+ *   cmp a, b; jcc target  ->  if (COND(a, b)) goto target;
+ * ================================================================ */
+
+/* Unsigned comparison conditions (from CMP a, b -> a - b) */
+#define CMP_EQ(a, b)  ((uint32_t)(a) == (uint32_t)(b))
+#define CMP_NE(a, b)  ((uint32_t)(a) != (uint32_t)(b))
+#define CMP_B(a, b)   ((uint32_t)(a) <  (uint32_t)(b))   /* below (CF=1) */
+#define CMP_AE(a, b)  ((uint32_t)(a) >= (uint32_t)(b))   /* above or equal */
+#define CMP_BE(a, b)  ((uint32_t)(a) <= (uint32_t)(b))   /* below or equal */
+#define CMP_A(a, b)   ((uint32_t)(a) >  (uint32_t)(b))   /* above */
+
+/* Signed comparison conditions */
+/* x86 evaluates the signed conditions at the operand width, not at 32 bits.
+   The generated code passes LO8/HI8/LO16 sub-register reads straight in, and
+   those zero-extend, so recover the width and sign-extend before comparing. */
+#define RECOMP_FLAG_WIDTH(a, b) (sizeof(a) < sizeof(b) ? sizeof(a) : sizeof(b))
+#define RECOMP_SIGNED(value, width) \
+    ((width) == 1u ? (int32_t)(int8_t)(uint8_t)(uint32_t)(value) \
+     : (width) == 2u ? (int32_t)(int16_t)(uint16_t)(uint32_t)(value) \
+     : (int32_t)(uint32_t)(value))
+#define CMP_L(a, b)   (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) <  \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* less */
+#define CMP_GE(a, b)  (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) >= \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* >= */
+#define CMP_LE(a, b)  (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) <= \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* <= */
+#define CMP_G(a, b)   (RECOMP_SIGNED(a, RECOMP_FLAG_WIDTH(a, b)) >  \
+                       RECOMP_SIGNED(b, RECOMP_FLAG_WIDTH(a, b)))  /* > */
+
+/* TEST-based conditions (AND without storing result) */
+#define TEST_Z(a, b)  (((uint32_t)(a) & (uint32_t)(b)) == 0)  /* ZF=1 */
+#define TEST_NZ(a, b) (((uint32_t)(a) & (uint32_t)(b)) != 0)  /* ZF=0 */
+#define TEST_S(a, b)  (RECOMP_SIGNED((uint32_t)(a) & (uint32_t)(b), \
+                                     RECOMP_FLAG_WIDTH(a, b)) < 0)  /* SF=1 */
+
+/* ================================================================
+ * Arithmetic with carry/overflow detection
+ * ================================================================ */
+
+/** Add with carry flag. Returns result, sets *cf. */
+static inline uint32_t ADD32_CF(uint32_t a, uint32_t b, int *cf) {
+    uint32_t r = a + b;
+    *cf = (r < a);
+    return r;
+}
+
+/** Sub with carry (borrow) flag. Returns result, sets *cf. */
+static inline uint32_t SUB32_CF(uint32_t a, uint32_t b, int *cf) {
+    *cf = (a < b);
+    return a - b;
+}
+
+/* ================================================================
+ * Rotation / shift helpers
+ * ================================================================ */
+
+/* x86 masks the rotate count to 5 bits, and THEN the rotate is modulo the
+ * operand's own width -- so `rol al, 16` is a rotate by zero and `rol ax, 31`
+ * is a rotate by 15. A narrow rotate performed at 32 bits is not a rotate at
+ * all: the bits that should wrap around at bit 7 or 15 land above the operand
+ * and are discarded by the store, which turns `ror al, 2` on 0x01 into 0x00
+ * where x86 gives 0x40.
+ *
+ * The zero case is separated out because `val >> (32 - 0)` is a shift of a
+ * uint32_t by 32, which is undefined behaviour -- it happened to survive
+ * because x86 masks shift counts to 5 bits and gives back `val`, but the
+ * compiler is under no obligation to agree, least of all at -O2. */
+static inline uint32_t ROL32(uint32_t val, int n) {
+    n &= 31;
+    return n ? ((val << n) | (val >> (32 - n))) : val;
+}
+
+static inline uint32_t ROR32(uint32_t val, int n) {
+    n &= 31;
+    return n ? ((val >> n) | (val << (32 - n))) : val;
+}
+
+/* rcl/rcr: rotate through the carry flag.
+ *
+ * The carry is a bit sitting one place above the operand's top bit, so the
+ * rotation is over width+1 bits. That is also why a count is reduced modulo
+ * width+1 for the 8- and 16-bit forms rather than modulo the width: a byte
+ * rotates through nine positions, not eight. The 32-bit form takes the count
+ * masked to five bits and no further, which is already inside 33.
+ *
+ * `cf` carries in and out.
+ */
+static inline uint32_t RC_ROT(uint32_t val, unsigned n, int *cf,
+                              unsigned width, int left) {
+    unsigned mod = width + 1u;
+    uint64_t mask = (width >= 32u) ? 0xFFFFFFFFull
+                                   : ((((uint64_t)1 << width) - 1u));
+    uint64_t x = (((uint64_t)(*cf & 1)) << width) | ((uint64_t)val & mask);
+
+    n &= 31u;
+    if (width < 32u)
+        n %= mod;
+    if (n) {
+        uint64_t full = (((uint64_t)1 << mod) - 1u);
+        x = left ? ((x << n) | (x >> (mod - n)))
+                 : ((x >> n) | (x << (mod - n)));
+        x &= full;
+    }
+    *cf = (int)((x >> width) & 1);
+    return (uint32_t)(x & mask);
+}
+
+static inline uint8_t ROL8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val << n) | (val >> (8 - n))) : val;
+}
+
+static inline uint8_t ROR8(uint8_t val, int n) {
+    n = (n & 31) % 8;
+    return n ? (uint8_t)((val >> n) | (val << (8 - n))) : val;
+}
+
+static inline uint16_t ROL16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val << n) | (val >> (16 - n))) : val;
+}
+
+static inline uint16_t ROR16(uint16_t val, int n) {
+    n = (n & 31) % 16;
+    return n ? (uint16_t)((val >> n) | (val << (16 - n))) : val;
+}
+
+/* ================================================================
+ * Sign/zero extension
+ * ================================================================ */
+
+#define ZX8(v)   ((uint32_t)(uint8_t)(v))
+#define ZX16(v)  ((uint32_t)(uint16_t)(v))
+#define SX8(v)   ((uint32_t)(int32_t)(int8_t)(v))
+#define SX16(v)  ((uint32_t)(int32_t)(int16_t)(v))
+
+/* ================================================================
+ * Byte/word register access
+ *
+ * These macros extract or set partial registers, matching x86
+ * behavior where writing AL doesn't affect bits 8-31 of EAX.
+ * ================================================================ */
+
+/** Extract low byte (al, bl, cl, dl). */
+#define LO8(r)  ((uint8_t)((r) & 0xFF))
+/** Extract high byte of low word (ah, bh, ch, dh). */
+#define HI8(r)  ((uint8_t)(((r) >> 8) & 0xFF))
+/** Extract low word (ax, bx, cx, dx). */
+#define LO16(r) ((uint16_t)((r) & 0xFFFF))
+
+/** Set low byte, preserving upper 24 bits. */
+#define SET_LO8(r, v)  ((r) = ((r) & 0xFFFFFF00u) | ((uint32_t)(uint8_t)(v)))
+/** Set high byte of low word, preserving other bits. */
+#define SET_HI8(r, v)  ((r) = ((r) & 0xFFFF00FFu) | (((uint32_t)(uint8_t)(v)) << 8))
+/** Set low word, preserving upper 16 bits. */
+#define SET_LO16(r, v) ((r) = ((r) & 0xFFFF0000u) | ((uint32_t)(uint16_t)(v)))
+
+/* ================================================================
+ * Stack simulation
+ *
+ * For push/pop heavy prologues in the generated code.
+ * ================================================================ */
+
+/**
+ * Push a 32-bit value onto the simulated stack.
+ * Evaluates val BEFORE decrementing sp, matching x86 semantics
+ * where push [esp+N] reads the operand before adjusting ESP.
+ */
+#define PUSH32(sp, val) do { \
+    uint32_t _pv = (uint32_t)(val); \
+    (sp) -= 4; \
+    MEM32(sp) = _pv; \
+} while(0)
+
+/**
+ * x86 parity flag: 1 when the low byte of the result has an EVEN number of set
+ * bits (that is what PF means). Used by the x87 float-compare idiom
+ * `fnstsw ax; test ah, mask; jp/jnp`, which is how all pre-SSE code branches on
+ * a float comparison. Without a real parity here the branch was hardcoded and
+ * every such comparison went one fixed direction.
+ */
+static inline int recomp_parity8(uint32_t x) {
+    x &= 0xFFu; x ^= x >> 4; x ^= x >> 2; x ^= x >> 1;
+    return (int)(~x & 1u);   /* 1 = even parity (PF set) */
+}
+#define RECOMP_PARITY8(x) recomp_parity8((uint32_t)(x))
+
+/**
+ * Pop a 32-bit value from the simulated stack.
+ * Reads the value, bumps sp, and only then writes dst, so `pop esp` -- dst
+ * and sp the same register -- leaves esp at the value popped, as x86 does.
+ * Assigning dst first and then adding 4 left it 4 too high: Spartan: Total
+ * Warrior's round-to-int helper (`push esp ... pop esp`) returned with esp
+ * off by 4 (found upstream, sp00nznet/xboxrecomp#186).
+ */
+#define POP32(sp, dst) do { \
+    uint32_t _pop_v = MEM32(sp); \
+    (sp) += 4; \
+    (dst) = _pop_v; \
+} while(0)
+
+/* ================================================================
+ * Byte swap (for endian conversion if needed)
+ *
+ * Xbox is little-endian like x86, so these are rarely needed,
+ * but some games use bswap for network byte order or data parsing.
+ * ================================================================ */
+
+static inline uint32_t BSWAP32(uint32_t v) {
+    return ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
+           ((v << 8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
+}
+
+static inline uint16_t BSWAP16(uint16_t v) {
+    return (uint16_t)((v >> 8) | (v << 8));
+}
+
+/* ================================================================
+ * Indirect call dispatch
+ *
+ * The dispatch system resolves Xbox virtual addresses to native
+ * function pointers at runtime. Three lookup sources are checked:
+ *   1. Manual overrides (hand-written reimplementations)
+ *   2. Generated dispatch table (auto-recompiled functions)
+ *   3. Kernel thunk bridge (Xbox kernel function replacements)
+ * ================================================================ */
+
+/**
+ * Generic function pointer type for all recompiled functions.
+ * All translated functions are void(void) - arguments and return
+ * values are passed through global registers and the simulated stack.
+ */
+#ifndef RECOMP_DISPATCH_H  /* avoid conflict with recomp_dispatch.h */
+typedef void (*recomp_func_t)(void);
+
+/**
+ * Look up a recompiled function by its Xbox VA.
+ * Returns NULL if the VA is not in the generated dispatch table.
+ */
+recomp_func_t recomp_lookup(uint32_t xbox_va);
+
+/**
+ * Build the flat, directly-indexed dispatch table.
+ *
+ * Turns recomp_lookup from a binary search over every translated function into
+ * a bounds check and one indexed load -- the C form of Microsoft's
+ * `jmp [table + guest_eip*8]`. Call it once at startup, before any recompiled
+ * code runs.
+ *
+ * Entirely optional: if it is never called, or returns 0 because the allocation
+ * failed, recomp_lookup keeps using the binary search and everything still
+ * works. Costs 8 bytes per byte of guest code span (see
+ * recomp_dispatch_flat_bytes), allocated with calloc so the untouched middle
+ * stays uncommitted.
+ *
+ * Returns 1 if the flat table is in use, 0 if the search is.
+ */
+int recomp_dispatch_init(void);
+
+/** Bytes held by the flat table, or 0 if it was never built. */
+size_t recomp_dispatch_flat_bytes(void);
+
+/**
+ * Look up a kernel thunk function by its synthetic VA.
+ * Kernel thunks live at 0xFE000000+ (synthetic addresses assigned
+ * during kernel bridge initialization).
+ * Returns NULL if the VA is not a kernel thunk.
+ */
+recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+
+/**
+ * Look up a manually overridden function by its Xbox VA.
+ * Manual overrides take priority over generated code.
+ * Returns NULL if no manual override exists for this VA.
+ */
+recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+#endif
+
+/**
+ * RECOMP_ABI_CALL - call a resolved target, optionally checking the ABI.
+ *
+ * ebx, esi and edi are callee-saved on x86, and the recompiler keeps them in
+ * globals rather than on the host's stack. So a lifted function that never
+ * reaches its own epilogue -- the usual cause is a decode that lost sync on
+ * embedded data -- does not merely lose its own state, it silently corrupts
+ * every caller's.
+ *
+ * That failure is invisible at the crash site: the caller carries on with a
+ * wrong loop cursor and simply does less work. Half-Life 2's C++ static
+ * initialiser walks 5,305 constructors with esi as the cursor and edi as the
+ * limit; a single callee returning with those changed ended the walk early and
+ * left Source with no registered interfaces, with no error anywhere.
+ *
+ * Build with -DRECOMP_ABI_CHECK to have every indirect call verify them and
+ * name the first offenders. esp is deliberately not checked: the convention
+ * decides whether the callee pops arguments, so there is no single correct
+ * value -- but there is one invariant that holds under every convention:
+ * the callee at least pops its own return address, so esp must come back
+ * at least 4 higher than it went in. Coming back lower means the epilogue
+ * never ran, which is the failure this exists to catch.
+ *
+ * Covers direct calls as well as indirect: tools/recomp emits every direct
+ * call through this macro, which expands to a plain call when the flag is
+ * off. That matters because CRT and static-initialiser paths -- where these
+ * clobbers actually bite -- are almost entirely direct calls.
+ * (An earlier note here said direct calls were a plain C call with no macro to
+ * hook, and concluded this was the wrong tool for early boot. That stopped
+ * being true when tools/recomp started routing every direct call through
+ * RECOMP_ABI_CALL. Early boot is now exactly where it earns its keep.)
+ *
+ * Build note: define RECOMP_ABI_CHECK for the runtime libraries too, not only
+ * for the generated game code. The check is emitted into generated code but
+ * recomp_abi_violation_log() is compiled into xbox_kernel, so setting it on the
+ * game target alone produces the calls without the callee and fails to link.
+ * The game template does this with a directory-scope add_compile_definitions()
+ * placed before add_subdirectory().
+ */
+#ifdef RECOMP_ABI_CHECK
+void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                              uint32_t edi0, uint32_t esp0);
+void recomp_abi_pop_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                                  uint32_t edi0, uint32_t esp0, uint32_t pop);
+#define RECOMP_ABI_CALL(va, fn) do { \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+    (fn)(); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
+        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
+} while(0)
+/* A direct call whose callee's own `ret N` is known (tools/recomp reads it
+ * from the callee's bytes). Then esp has exactly one right value afterwards,
+ * so a stack that comes back too HIGH -- invisible to the one-sided check
+ * above -- is caught at the call that did it rather than frames later.
+ * Burnout 2's CDirectSoundBuffer_GetStatus came back 8 high once in 4.5
+ * million calls, rotated its caller's saved registers, and the title crashed
+ * three frames up with a code address used as an object. */
+#define RECOMP_ABI_CALL_POP(va, fn, pop) do { \
+    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
+    (fn)(); \
+    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || \
+        g_esp != _ap + 4 + (pop)) \
+        recomp_abi_pop_violation_log((va), _ab, _as, _ad, _ap, (pop)); \
+} while(0)
+#else
+#define RECOMP_ABI_CALL(va, fn) (fn)()
+#define RECOMP_ABI_CALL_POP(va, fn, pop) (fn)()
+#endif
+
+/* A guarded arm of an indirect call. When a recorded run saw a call site
+ * reach only a few translated functions, the lifter compares the target
+ * against each and calls the match directly (RECOMP_ABI_CALL), falling back
+ * to RECOMP_ICALL_SAFE_AT for anything else -- so an unseen target is slow,
+ * never wrong. Under RECOMP_ICALL_FEEDBACK the arms are counted, so a run
+ * can say how often the guards held; otherwise they cost nothing. */
+#ifdef RECOMP_ICALL_FEEDBACK
+extern volatile uint64_t g_icall_guard_hits;
+extern volatile uint64_t g_icall_guard_misses;
+#define RECOMP_ICALL_GUARD_HIT()  ((void)g_icall_guard_hits++)
+#define RECOMP_ICALL_GUARD_MISS() ((void)g_icall_guard_misses++)
+#else
+#define RECOMP_ICALL_GUARD_HIT()  ((void)0)
+#define RECOMP_ICALL_GUARD_MISS() ((void)0)
+#endif
+
+/**
+ * RECOMP_ICALL - Indirect call through the dispatch table.
+ *
+ * Looks up the Xbox VA and calls the translated function.
+ * Falls back to kernel bridge for kernel thunk synthetic VAs.
+ * The caller must PUSH32 the guest return address before this macro.
+ * If not found, pops it back off to keep the stack balanced.
+ *
+ * RECOMP_ICALL_IS_CODE skips garbage VAs that come from uninitialized vtable
+ * pointers. Kernel thunks at 0xFE000000+ are never blocked.
+ *
+ * Nothing to customize: the range comes from g_xbox_code_lo/g_xbox_code_hi,
+ * which the memory layout fills in from the sections it actually mapped. This
+ * used to say "change the VA range check to match your game's code range",
+ * left over from a hardcoded 0x00400000 cutoff that was only ever right for
+ * one title. Editing this header per project is no longer a thing.
+ */
+#define RECOMP_ICALL(xbox_va) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    /* Skip garbage VAs outside code section + kernel thunk range */ \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ICALL_SAFE - Stack-safe indirect call.
+ *
+ * Restores g_esp to saved_esp (pre-argument value) on lookup failure,
+ * preventing stdcall argument leaks on failed vtable calls.
+ * Use this when the caller pushes arguments that the callee would
+ * normally clean up (stdcall convention).
+ */
+/* Calling an XDK replacement whose arguments the linker put in registers.
+ *
+ * A title built with link-time code generation gets rewritten calling
+ * conventions, and the signature database records what happened in the name:
+ * D3DDevice_SelectVertexShader_0__LTCG_eax1_ebx2 takes both arguments in
+ * registers and none on the stack. The replacements in src/hle are written
+ * against the ordinary convention and read everything with HLE_ARG, which
+ * reads the guest stack.
+ *
+ * Rather than write every implementation twice, the generated thunk lays out
+ * an ordinary argument frame just below the stack, fills it from the
+ * registers the name specifies and from the caller's own stack arguments for
+ * the rest, and points g_esp at it for the duration of the call. The
+ * implementation cannot tell the difference. The frame sits in stack space
+ * the callee would have used anyway, and g_esp is restored afterwards to
+ * exactly what an ordinary thunk would leave.
+ *
+ * tools/recomp/hle.py emits these; nothing else should use them.
+ */
+#define RECOMP_HLE_STACK(i) MEM32(_hle_stack + 4u * (uint32_t)(i))
+
+#define RECOMP_HLE_MAX_ARGS 24u
+
+#define RECOMP_HLE_LTCG_CALL(n, fn, total_pop) \
+    { \
+        uint32_t _hle_n     = (uint32_t)(n); \
+        uint32_t _hle_ret   = MEM32(g_esp); \
+        uint32_t _hle_stack = g_esp + 4u; \
+        uint32_t _hle_save  = g_esp; \
+        uint32_t _hle_frame = g_esp - 4u * (_hle_n + 4u); \
+        uint32_t _hle_pop   = (uint32_t)(total_pop); \
+        uint32_t a[RECOMP_HLE_MAX_ARGS]; \
+        uint32_t _hle_i; \
+        void (*_hle_fn)(void) = (fn); \
+        uint32_t _hle_prev_esp = g_hle_ltcg_esp, _hle_prev_n = g_hle_ltcg_nargs; \
+        uint32_t _hle_prev_regs[6]; \
+        memcpy(_hle_prev_regs, g_hle_ltcg_regs, sizeof _hle_prev_regs); \
+        g_hle_ltcg_regs[0] = g_eax; g_hle_ltcg_regs[1] = g_ecx; \
+        g_hle_ltcg_regs[2] = g_edx; g_hle_ltcg_regs[3] = g_ebx; \
+        g_hle_ltcg_regs[4] = g_esi; g_hle_ltcg_regs[5] = g_edi; \
+        (void)_hle_stack;
+
+#define RECOMP_HLE_LTCG_END \
+        MEM32(_hle_frame) = _hle_ret; \
+        for (_hle_i = 0; _hle_i < _hle_n && _hle_i < RECOMP_HLE_MAX_ARGS; _hle_i++) \
+            MEM32(_hle_frame + 4u + 4u * _hle_i) = a[_hle_i]; \
+        g_hle_ltcg_esp = _hle_save; \
+        g_hle_ltcg_nargs = _hle_n ? _hle_n : 1u; \
+        g_esp = _hle_frame; \
+        _hle_fn(); \
+        g_hle_ltcg_esp = _hle_prev_esp; \
+        g_hle_ltcg_nargs = _hle_prev_n; \
+        memcpy(g_hle_ltcg_regs, _hle_prev_regs, sizeof _hle_prev_regs); \
+        g_esp = _hle_save + _hle_pop; \
+    }
+
+#define RECOMP_ICALL_SAFE(xbox_va, saved_esp) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
+        g_esp = (saved_esp); eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ICALL_SAFE_CC - RECOMP_ICALL_SAFE for a call the caller cleans up.
+ *
+ * The lifter picks this form when the guest instruction straight after the
+ * call is `add esp, imm` (cdecl): the caller pops the arguments itself, so a
+ * failed lookup must pop only the return address. Rewinding to saved_esp
+ * there cleaned the arguments twice and left esp high for the caller's
+ * epilogue (sp00nznet/xboxrecomp#169). saved_esp is unused for the rewind:
+ * g_esp on entry is the esp just after the return-address push, so the
+ * pre-push esp -- what the not-code log reads the caller from -- is g_esp + 4.
+ * The fail-log hand-off is the same as RECOMP_ICALL_SAFE's.
+ */
+#define RECOMP_ICALL_SAFE_CC(xbox_va, saved_esp) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ICALL_SAFE_AT - RECOMP_ICALL_SAFE that also names the call SITE.
+ *
+ * `site` is the guest address of the `call` instruction. Under
+ * RECOMP_ICALL_FEEDBACK the runtime records which targets each site reaches
+ * (icall_sites.dump), which is what lets the lifter guard a site with direct
+ * calls on the next generation. Everything else is RECOMP_ICALL_SAFE, line
+ * for line -- including this fork's not-code log with the saved esp and the
+ * g_icall_saved_esp / g_icall_dispatch_form hand-off to the fail log, which
+ * upstream's copy of the macro predates. Keep the two in step.
+ */
+#define RECOMP_ICALL_SAFE_AT(xbox_va, saved_esp, site) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, (saved_esp)); \
+        g_esp = (saved_esp); eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp = (saved_esp); eax = 0; } \
+} while(0)
+
+/* RECOMP_ICALL_SAFE_AT_CC - RECOMP_ICALL_SAFE_AT for a call the caller
+ * cleans up; see RECOMP_ICALL_SAFE_CC. Keep the four macros in step. */
+#define RECOMP_ICALL_SAFE_AT_CC(xbox_va, saved_esp, site) do { \
+    (void)(saved_esp); \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
+    g_icall_trace_idx++; \
+    g_icall_count++; \
+    if (!RECOMP_ICALL_IS_CODE(_va)) { \
+        recomp_icall_not_code_log(_va, g_esp + 4); \
+        g_esp += 4; eax = 0; break; \
+    } \
+    RECOMP_ICALL_OBSERVE_SITE((site), _va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 1; \
+           recomp_icall_fail_log(_va); g_esp += 4; eax = 0; } \
+} while(0)
+
+/**
+ * RECOMP_ITAIL - Indirect tail call (jmp through function pointer).
+ *
+ * No return address is pushed - reuses the current frame's return addr.
+ * Used for tail-call optimization where the original code uses
+ * jmp [reg] instead of call [reg].
+ */
+#define RECOMP_ITAIL(xbox_va) do { \
+    uint32_t _va = (uint32_t)(xbox_va); \
+    recomp_func_t _fn = recomp_lookup_manual(_va); \
+    if (!_fn) _fn = recomp_lookup(_va); \
+    if (!_fn) _fn = recomp_lookup_kernel(_va); \
+    if (_fn) { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_RESOLVED); \
+               RECOMP_ABI_CALL(_va, _fn); } \
+    else { RECOMP_ICALL_OBSERVE(_va, RECOMP_ICALL_SEEN_UNRESOLVED); \
+           g_icall_saved_esp = g_esp; g_icall_dispatch_form = 2; \
+           recomp_icall_fail_log(_va); g_esp += 4; g_eax = 0; } \
+} while(0)
+
+/* ================================================================
+ * Register name aliases for generated code
+ *
+ * Map x86 volatile register names to global variables.
+ * These #defines allow the generated code to use natural register
+ * names (eax, ecx, edx, esp) which the preprocessor maps to the
+ * corresponding globals (g_eax, g_ecx, g_edx, g_esp).
+ *
+ * Only active when RECOMP_GENERATED_CODE is defined (in generated
+ * .c files) to avoid polluting hand-written code.
+ * ================================================================ */
+
+#ifdef RECOMP_GENERATED_CODE
+#define eax g_eax
+#define ecx g_ecx
+#define edx g_edx
+#define esp g_esp
+#define ebx g_ebx
+#define esi g_esi
+#define edi g_edi
+
+/* ebp is NOT global - it's local in each function.
+ * For __SEH_prolog/epilog, use g_seh_ebp to bridge. */
+#endif
+
+/* ================================================================
+ * Forward declarations for translated functions
+ *
+ * These are generated by the recompiler and included per-file.
+ * The recomp_funcs.h header (generated) declares all translated
+ * function prototypes.
+ * ================================================================ */
+
+/* An instruction the lifter has no translation for.
+ *
+ * The lifter used to emit a bare "TODO: mnemonic" C comment at such a site,
+ * and a comment is a no-op: the instruction vanished, the guest carried
+ * on, and nothing at runtime could say the site had been reached. Wreckless
+ * died inside RtlAllocateHeap because `bsf` was a comment; Half-Life 2 painted
+ * its intro red because `cvtpi2ps` was. Each was found by working backwards
+ * from a subsystem failure that had nothing to do with the cause.
+ *
+ * Now the site calls this, with the instruction text and its guest address.
+ * The instruction is STILL a no-op -- this changes no behaviour -- but the run
+ * names the untranslated sites it reached (the first fifty hits, in
+ * src/kernel/recomp_trace.c), and with RECOMP_UNIMPL_TRAP=1 it stops at the
+ * first one. The lifter
+ * keeps the comment beside the call so `grep TODO:` over a gen tree still
+ * enumerates every site whether or not it is ever reached. */
+void recomp_unimpl(const char *text, uint32_t va);
+#define RECOMP_UNIMPL(_text, _va) recomp_unimpl((_text), (_va))
+
+/* ================================================================
+ * SSE, XMM and MMX: recomp_types_simd.h
+ *
+ * The packed-register model is half of this header's text and most of its
+ * churn, and most chunks never touch it: 3 of TimeSplitters 2's 28 use an XMM
+ * or MMX helper at all. Every generated file includes this header, so with
+ * the SIMD model in it, a fix to one MMX helper rebuilt all of them.
+ *
+ * So it lives in its own file and is included unless the includer says it
+ * does not need it. tools/recomp puts `#define RECOMP_NO_SIMD` ahead of the
+ * include in a generated file that names nothing recomp_types_simd.h
+ * defines, so that file neither parses nor depends on it. Everything else --
+ * hand-written code, tests, a lift from before the split -- gets the whole
+ * model exactly as before. A chunk that wrongly claims RECOMP_NO_SIMD fails to
+ * compile (an undeclared helper is an error), never silently.
+ * ================================================================ */
+#ifndef RECOMP_NO_SIMD
+#include "recomp_types_simd.h"
+#endif
+
+#endif /* RECOMP_TYPES_H */

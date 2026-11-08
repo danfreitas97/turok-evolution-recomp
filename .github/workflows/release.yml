@@ -37,16 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The toolkit, and of its submodules only what the release builds.
+      # The toolkit is in the repository; its libraries are submodules.
       - name: Fetch the toolkit
         run: |
-          git submodule update --init --depth 1 xboxrecomp
-          git -C xboxrecomp submodule update --init --depth 1 \
-            third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator \
-            third_party/libsamplerate third_party/miniupnp
-          git -C xboxrecomp submodule update --init --recursive --depth 1 \
-            third_party/XbSymbolDatabase
+          git submodule update --init --recursive --depth 1
 
       # The release's zig compiles against its own glibc headers; these are
       # what SDL loads at run time, searched after them.
@@ -93,13 +87,7 @@ jobs:
 
       - name: Fetch the toolkit
         run: |
-          git submodule update --init --depth 1 xboxrecomp
-          git -C xboxrecomp submodule update --init --depth 1 \
-            third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator \
-            third_party/libsamplerate third_party/miniupnp
-          git -C xboxrecomp submodule update --init --recursive --depth 1 \
-            third_party/XbSymbolDatabase
+          git submodule update --init --recursive --depth 1
 
       - uses: actions/cache@v4
         with:
@@ -142,13 +130,7 @@ jobs:
 
       - name: Fetch the toolkit
         run: |
-          git submodule update --init --depth 1 xboxrecomp
-          git -C xboxrecomp submodule update --init --depth 1 \
-            third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator \
-            third_party/libsamplerate third_party/miniupnp
-          git -C xboxrecomp submodule update --init --recursive --depth 1 \
-            third_party/XbSymbolDatabase
+          git submodule update --init --recursive --depth 1
 
       - uses: actions/cache@v4
         with:
@@ -185,13 +167,7 @@ jobs:
 
       - name: Fetch the toolkit
         run: |
-          git submodule update --init --depth 1 xboxrecomp
-          git -C xboxrecomp submodule update --init --depth 1 \
-            third_party/SDL third_party/Vulkan-Headers \
-            third_party/volk third_party/VulkanMemoryAllocator \
-            third_party/libsamplerate third_party/miniupnp
-          git -C xboxrecomp submodule update --init --recursive --depth 1 \
-            third_party/XbSymbolDatabase
+          git submodule update --init --recursive --depth 1
 
       # A tag's APK must carry the release key: one signed with a throwaway
       # key would not install over the last release. So must a dry run's

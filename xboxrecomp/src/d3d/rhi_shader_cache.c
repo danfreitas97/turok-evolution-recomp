@@ -1,0 +1,323 @@
+/*
+ * rhi_shader_cache.c - compiled shaders kept on disk between runs
+ *
+ * Every shader the renderer makes is HLSL generated at run time and compiled
+ * when a draw first needs it: D3DCompile for D3D11, DXC to SPIR-V for
+ * Vulkan. Each compile is a hitch of tens of milliseconds on the thread that
+ * draws -- OutRun 2 pays about 45 of them a run, ~50 ms each, and pays them
+ * again every run, because the in-memory caches are thrown away at exit.
+ *
+ * So the compiled blob is kept, one file per shader, under
+ *   <cache dir>/shadercache/<title id>/<backend>/<key>.bin
+ * (recomp_cache_dir: %APPDATA%\xboxrecomp on Windows, ~/Library/Caches/xboxrecomp
+ * on macOS). The key is a hash of everything that
+ * went into the compile: the HLSL, its macros, entry point, profile and
+ * optimisation flag, plus a backend tag that names the compile settings. A
+ * change to the generator changes the HLSL and so the key; nothing has to be
+ * invalidated by hand. Each file also holds that key text in full and a load
+ * compares it byte for byte, so a hash collision reads as a miss, never as
+ * the wrong shader.
+ *
+ * Files are written to a temporary name and renamed into place, since
+ * shaders compile on whichever guest thread draws. RECOMP_SHADER_CACHE=0
+ * turns it off.
+ */
+
+#include "rhi.h"
+#include "rhi_shader_cache.h"
+#include "recomp_config.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#  define SEP "\\"
+#  define make_dir(d)             CreateDirectoryA((d), NULL)
+#  define replace_file(from, to)  MoveFileExA((from), (to), MOVEFILE_REPLACE_EXISTING)
+#  define remove_file(p)          DeleteFileA(p)
+#  define writer_id()             ((unsigned long)GetCurrentThreadId())
+#  define count_up(p)             InterlockedIncrement(p)
+typedef LONG Count;
+#else
+#  include <errno.h>
+#  include <pthread.h>
+#  include <strings.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#  define SEP "/"
+#  define _stricmp strcasecmp
+/* mkdir -p: the user directory's parent (~/.config) need not exist yet. */
+static void make_dir(const char *d)
+{
+    char p[1024];
+    size_t i, n = strlen(d);
+
+    if (n >= sizeof p)
+        return;
+    memcpy(p, d, n + 1);
+    for (i = 1; i < n; i++)
+        if (p[i] == '/') {
+            p[i] = 0;
+            mkdir(p, 0777);
+            p[i] = '/';
+        }
+    mkdir(p, 0777);
+}
+/* rename() replaces atomically, which is what MoveFileEx is used for. */
+#  define replace_file(from, to)  (rename((from), (to)) == 0)
+#  define remove_file(p)          unlink(p)
+/* Unique per writer: the temporary's name only has to differ between two
+ * threads (or two processes) writing the same shader at once. */
+#  define writer_id()             ((unsigned long)getpid() * 1000003ul ^ \
+                                   (unsigned long)(uintptr_t)pthread_self())
+#  define count_up(p)             __atomic_add_fetch((p), 1, __ATOMIC_SEQ_CST)
+typedef long Count;
+#endif
+
+#define CACHE_MAGIC   0x43535258u   /* "XRSC" */
+#define CACHE_VERSION 1u
+
+/* Everything the compile depended on, as one byte string. */
+typedef struct {
+    char  *p;
+    size_t n, cap;
+} KeyText;
+
+static int key_add(KeyText *k, const void *data, size_t n)
+{
+    if (k->n + n + 1 > k->cap) {
+        size_t cap = k->cap ? k->cap * 2 : 4096;
+        char *p;
+
+        while (cap < k->n + n + 1)
+            cap *= 2;
+        p = (char *)realloc(k->p, cap);
+        if (!p)
+            return 0;
+        k->p = p;
+        k->cap = cap;
+    }
+    memcpy(k->p + k->n, data, n);
+    k->n += n;
+    k->p[k->n++] = 0;               /* a separator no field can contain */
+    return 1;
+}
+
+static int key_add_str(KeyText *k, const char *s)
+{
+    return key_add(k, s ? s : "", s ? strlen(s) : 0);
+}
+
+static int key_build(KeyText *k, const RhiShaderSource *src, const char *backend)
+{
+    char opt[8];
+    const RhiMacro *m;
+
+    memset(k, 0, sizeof *k);
+    snprintf(opt, sizeof opt, "%u", src->optimize ? 1u : 0u);
+    if (!key_add_str(k, backend) || !key_add_str(k, src->entry) ||
+        !key_add_str(k, src->target) || !key_add_str(k, opt))
+        return 0;
+    for (m = src->macros; m && m->name; m++)
+        if (!key_add_str(k, m->name) || !key_add_str(k, m->value))
+            return 0;
+    return key_add(k, src->hlsl, src->len);
+}
+
+static uint64_t fnv64(const char *p, size_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)p[i];
+        h *= 0x100000001B3ull;
+    }
+    return h;
+}
+
+static int cache_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *v = getenv("RECOMP_SHADER_CACHE");
+        on = !(v && (strcmp(v, "0") == 0 || _stricmp(v, "off") == 0));
+    }
+    return on;
+}
+
+/* The directory for this backend, made on first use. 0 if there is none. */
+static int cache_dir(const char *backend, char *out, size_t n)
+{
+    char base[600];
+    int len;
+
+    /* Disposable, so the cache directory (~/Library/Caches/xboxrecomp on
+     * macOS, $XDG_CACHE_HOME/xboxrecomp on Linux); on Windows that is the
+     * same %APPDATA%\xboxrecomp the cache always lived in. */
+    if (!recomp_cache_dir(base, sizeof base))
+        return 0;
+    make_dir(base);
+    len = snprintf(out, n, "%s" SEP "shadercache", base);
+    if (len <= 0 || (size_t)len >= n)
+        return 0;
+    make_dir(out);
+    len = snprintf(out, n, "%s" SEP "shadercache" SEP "%08X", base,
+                   (unsigned)recomp_config_title_id());
+    if (len <= 0 || (size_t)len >= n)
+        return 0;
+    make_dir(out);
+    len = snprintf(out, n, "%s" SEP "shadercache" SEP "%08X" SEP "%s", base,
+                   (unsigned)recomp_config_title_id(), backend);
+    if (len <= 0 || (size_t)len >= n)
+        return 0;
+    make_dir(out);
+    return 1;
+}
+
+static int cache_path(const char *backend, const KeyText *k, char *out, size_t n)
+{
+    char dir[800];
+    int len;
+
+    if (!cache_dir(backend, dir, sizeof dir))
+        return 0;
+    len = snprintf(out, n, "%s" SEP "%016llX.bin", dir,
+                   (unsigned long long)fnv64(k->p, k->n));
+    return len > 0 && (size_t)len < n;
+}
+
+static volatile Count g_hits, g_misses, g_writes;
+
+static void note(const char *what, Count n)
+{
+    /* 1, 10, 100, ... so a run says the cache is working without a line a
+     * shader. */
+    Count p = 1;
+
+    while (p < n && p < 1000000)
+        p *= 10;
+    if (p == n) {
+        fprintf(stderr, "[SHADER-CACHE] %s: %ld\n", what, (long)n);
+        fflush(stderr);
+    }
+}
+
+int rhi_shader_cache_get(const RhiShaderSource *src, const char *backend,
+                         void **blob, size_t *bytes)
+{
+    KeyText k;
+    char path[1024];
+    FILE *f = NULL;
+    uint32_t hdr[4];
+    char *stored = NULL;
+    void *data = NULL;
+    int ok = 0;
+
+    *blob = NULL;
+    *bytes = 0;
+    if (!cache_enabled() || !src || !src->hlsl)
+        return 0;
+    if (!key_build(&k, src, backend))
+        goto done;
+    if (!cache_path(backend, &k, path, sizeof path))
+        goto done;
+    f = fopen(path, "rb");
+    if (!f)
+        goto done;
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != CACHE_MAGIC ||
+        hdr[1] != CACHE_VERSION || hdr[2] != (uint32_t)k.n || !hdr[3] ||
+        hdr[3] > 64u * 1024u * 1024u)
+        goto done;
+    stored = (char *)malloc(k.n);
+    data = malloc(hdr[3]);
+    if (!stored || !data || fread(stored, 1, k.n, f) != k.n ||
+        memcmp(stored, k.p, k.n) != 0 || fread(data, 1, hdr[3], f) != hdr[3])
+        goto done;
+    *blob = data;
+    *bytes = hdr[3];
+    data = NULL;
+    ok = 1;
+done:
+    if (f)
+        fclose(f);
+    free(stored);
+    free(data);
+    free(k.p);
+    if (cache_enabled())
+        note(ok ? "loaded from disk" : "not on disk, compiling",
+             count_up(ok ? &g_hits : &g_misses));
+    return ok;
+}
+
+void rhi_shader_cache_put(const RhiShaderSource *src, const char *backend,
+                          const void *blob, size_t bytes)
+{
+    KeyText k;
+    char path[1024], tmp[1100];
+    FILE *f;
+    uint32_t hdr[4];
+    int ok;
+
+    if (!cache_enabled() || !src || !src->hlsl || !blob || !bytes)
+        return;
+    if (!key_build(&k, src, backend)) {
+        free(k.p);
+        return;
+    }
+    if (!cache_path(backend, &k, path, sizeof path)) {
+        free(k.p);
+        return;
+    }
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, writer_id());
+    f = fopen(tmp, "wb");
+    if (!f) {
+        free(k.p);
+        return;
+    }
+    hdr[0] = CACHE_MAGIC;
+    hdr[1] = CACHE_VERSION;
+    hdr[2] = (uint32_t)k.n;
+    hdr[3] = (uint32_t)bytes;
+    ok = fwrite(hdr, sizeof hdr, 1, f) == 1 && fwrite(k.p, 1, k.n, f) == k.n &&
+         fwrite(blob, 1, bytes, f) == bytes;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || !replace_file(tmp, path))
+        remove_file(tmp);
+    else
+        note("written to disk", count_up(&g_writes));
+    free(k.p);
+}
+
+int rhi_cache_file_write(const char *path, const void *data, size_t n)
+{
+    char tmp[1100];
+    FILE *f;
+    int ok;
+
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", path, writer_id());
+    f = fopen(tmp, "wb");
+    if (!f)
+        return 0;
+    ok = fwrite(data, 1, n, f) == n;
+    ok = (fclose(f) == 0) && ok;
+    if (!ok || !replace_file(tmp, path)) {
+        remove_file(tmp);
+        return 0;
+    }
+    return 1;
+}
+
+int rhi_cache_file_path(const char *backend, const char *name, char *out, size_t n)
+{
+    char dir[800];
+    int len;
+
+    if (!cache_enabled() || !cache_dir(backend, dir, sizeof dir))
+        return 0;
+    len = snprintf(out, n, "%s" SEP "%s", dir, name);
+    return len > 0 && (size_t)len < n;
+}

@@ -1,0 +1,2770 @@
+/*
+ * launcher.c -- the window a player opens before the game.
+ *
+ * Its whole job: show the handful of settings that are worth choosing,
+ * write them to the file the runtime reads, start the game and get out
+ * of the way. Everything else the runtime can be told stays where it
+ * was, in environment variables, for people who want it.
+ *
+ * It can be driven entirely with a pad. That is not a flourish: the
+ * front ends this ships inside -- a living-room build, GameNative and
+ * the like -- may never see a keyboard, and a launcher that needs a
+ * mouse to get past is a launcher that stops the game starting. D-pad
+ * or stick to move, A to play, B to quit, shoulders to change tab.
+ *
+ * The drawing is all in launcher_theme.c, so this file is about what the
+ * settings are and how they are moved between, not about pixels. The window
+ * is the front end's (launcher.h), so nothing here is one host's.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>        /* game_intact: a release's junctions */
+#define strcasecmp _stricmp
+#else
+#include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
+#endif
+#if defined(__APPLE__)
+#include <ftw.h>
+#include <sys/xattr.h>
+#endif
+
+#include "launcher.h"
+#include "launcher_theme.h"
+#include "launcher_bindings.h"
+#include "recomp_config.h"
+#include "recomp_pad.h"
+#include "net_upnp.h"
+#include "platform/host_main.h"
+
+#ifndef LAUNCHER_GAME_EXE
+#define LAUNCHER_GAME_EXE "game.exe"
+#endif
+/* The image the game boots, which the launcher reads for its name and id.
+ * recomp_add_launcher reads it out of the title's main.c, as it does the
+ * folder. */
+#ifndef LAUNCHER_GAME_XBE
+#define LAUNCHER_GAME_XBE "default.xbe"
+#endif
+
+#define LAUNCHER_PATH 1024
+
+/* Who asks about the firewall, and the clipboard's keys, as the player
+ * knows them. */
+#if defined(__APPLE__)
+#define LAUNCHER_FIREWALL  "macOS"
+#define LAUNCHER_COPY_KEY  "Cmd+C"
+#define LAUNCHER_PASTE_KEY "Cmd+V"
+#elif defined(_WIN32)
+#define LAUNCHER_FIREWALL  "Windows"
+#define LAUNCHER_COPY_KEY  "Ctrl+C"
+#define LAUNCHER_PASTE_KEY "Ctrl+V"
+#else
+#define LAUNCHER_FIREWALL  "Your system"
+#define LAUNCHER_COPY_KEY  "Ctrl+C"
+#define LAUNCHER_PASTE_KEY "Ctrl+V"
+#endif
+
+/* The client area as it really is. On a display at 125% these are not
+ * LAUNCHER_WINDOW_W/H: asking Windows not to scale us and then laying out
+ * against the true size is the difference between a crisp launcher and
+ * one stretched up from a smaller drawing. */
+static int g_cw = LAUNCHER_WINDOW_W, g_ch = LAUNCHER_WINDOW_H;
+
+/* ------------------------------------------------------------- settings */
+
+typedef enum { ROW_INT, ROW_BOOL, ROW_CHOICE, ROW_TEXT } RowKind;
+
+typedef struct Row {
+    const char *label;
+    const char *help;
+    RowKind     kind;
+    int         lo, hi;                 /* ROW_INT */
+    const char *const *choices;         /* ROW_CHOICE, NULL terminated */
+    int        *ival;                   /* ROW_INT / ROW_BOOL / ROW_CHOICE index */
+    char       *text;                   /* ROW_TEXT: typed into, Ctrl+V pastes */
+    size_t      text_len;
+    const char *empty;                  /* ROW_TEXT: shown while there is no text */
+    int         digits;                 /* ROW_TEXT: only 0-9 may be typed */
+} Row;
+
+static const char *const k_frame_caps_console[] = { "adaptive", "60", "30", "0", NULL };
+/* A title whose logic keeps time (recomp_title_keeps_time) runs at the
+ * right speed above 60 too, so it is offered the common display rates.
+ * Adaptive 60 stays first, and the default. */
+static const char *const k_frame_caps_time[] = {
+    "adaptive", "60", "30", "90", "120", "144", "165", "240", "0", NULL
+};
+static const char *const *k_frame_caps = k_frame_caps_console;
+
+static RecompSettings g_settings;
+static int            g_frame_cap_index;   /* into k_frame_caps */
+static int            g_widescreen;        /* the row; settings_save applies it */
+
+static Row  g_video_rows[12];
+static int  g_video_count;
+
+/* ---- System Link ---- */
+
+/* The rows depend on the mode: a host is not asked for an address, and a
+ * joining copy is not asked about its router. */
+static const char *const k_link_modes[] = { "off", "host", "join", NULL };
+#define LINK_OFF   0
+#define LINK_HOST  1
+#define LINK_JOIN  2
+#define LINK_BY_HAND (-1)               /* "udp", set in the file; kept as it is */
+
+static int           g_link_mode;
+static char          g_port_text[8];
+static Row           g_link_rows[6];
+static int           g_link_count;
+static char          g_lan_addr[64];    /* this PC on its network */
+static NetUpnpResult g_probe;           /* what the router said */
+static volatile long g_probe_state;     /* 0 not asked, 1 asking, 2 answered */
+static uint64_t      g_copied_until;    /* "copied" shown until then */
+
+/* ---- input ---- */
+
+static BindConfig g_bind;
+static int        g_bind_port;          /* 0..3, the controller being edited */
+static int        g_bind_top;           /* first control shown: the list scrolls */
+static int        g_bind_col;           /* 0 pad, 1 keyboard and mouse */
+static int        g_capturing;          /* waiting for a press to bind */
+static int        g_capture_armed;      /* everything released since we started */
+static int        g_bind_dirty;
+
+/* Which row of whichever list is showing. Declared here rather than with
+ * the rest of the window state because the capture below reads it. */
+static int        g_sel;
+
+#define BIND_ROWS_VISIBLE 8           /* the head rows and the first two controls */
+
+/* The input list starts with rows that are not controls: which controller
+ * is being edited, what it reads from, mouse look, and putting it back.
+ * They live in the list rather than off to one side so they are reached
+ * the same way as everything else -- one way to move, one way to
+ * change, and no second idea to learn. */
+#define BIND_HEAD_ROWS 6
+#define BIND_ROW_PORT   0
+#define BIND_ROW_DEVICE 1
+#define BIND_ROW_API    2       /* SDL3 or XInput, for every controller */
+#define BIND_ROW_MOUSE  3       /* mouse look: this game's setting, not the bindings' */
+#define BIND_ROW_SENS   4       /* how far the mouse pushes the stick */
+#define BIND_ROW_RESET  5
+#define BIND_TOTAL_ROWS (BIND_HEAD_ROWS + BIND_CONTROLS)
+
+static const char *frame_cap_label(int i)
+{
+    static char label[32];
+    const char *cap = k_frame_caps[i];
+
+    if (strcmp(cap, "adaptive") == 0)
+        return "Adaptive (as the console)";
+    if (strcmp(cap, "0") == 0)
+        return "Uncapped";
+    snprintf(label, sizeof label, "%s frames a second", cap);
+    return label;
+}
+
+static void build_rows(void)
+{
+    Row *r = g_video_rows;
+
+    r->label = "Resolution";
+    r->help  = "Render larger than the console, then filter back down. Costs little.";
+    r->kind  = ROW_INT; r->lo = 1; r->hi = 8; r->ival = &g_settings.resolution_scale;
+    r++;
+
+#ifndef LAUNCHER_NO_WIDESCREEN
+    /* Hidden for a title built with recomp_add_launcher(... NO_WIDESCREEN),
+     * where a wider picture cannot be right; settings_save writes it off.
+     *
+     * One switch. There were two -- this and "Wide camera", the Hor+ factor
+     * -- and which pair was right depended on whether the game has a 16:9
+     * mode of its own, which a player has no way to know: the wrong pair
+     * was a stretched picture, or a view widened twice. The game works that
+     * out for itself now, when it starts (recomp_config.h, "widescreen"),
+     * and all that is left to say here is what this game will do with the
+     * switch, as its project describes it. */
+    r->label = "Widescreen";
+    switch (recomp_widescreen_title_mode()) {
+    case RECOMP_WIDE_NATIVE:
+        r->help = "Play at 16:9, in the game's own widescreen mode.";
+        break;
+    case RECOMP_WIDE_HOR_PLUS:
+        r->help = "Play at 16:9. The camera is widened to match, so you see more"
+                  " to the sides.";
+        break;
+    default:
+        r->help = "Play at 16:9, in the game's own widescreen mode. A game without"
+                  " one will look stretched.";
+        break;
+    }
+    r->kind  = ROW_BOOL; r->ival = &g_widescreen;
+    r++;
+#endif
+
+    r->label = "Texture sharpness";
+    r->help  = "Sharpen textures seen at a glancing angle: floors, walls, roads.";
+    r->kind  = ROW_INT; r->lo = 1; r->hi = 16; r->ival = &g_settings.anisotropy;
+    r++;
+
+    r->label = "Frame rate";
+    r->help  = recomp_title_keeps_time()
+             ? "Adaptive paces the game at 60, as the console did. This game keeps"
+               " time, so it plays right faster too. F10 changes it while playing."
+             : "Adaptive paces the game the way the console did. F10 changes it"
+               " while playing.";
+    r->kind  = ROW_CHOICE; r->choices = k_frame_caps; r->ival = &g_frame_cap_index;
+    r++;
+
+    r->label = "Show frame rate";
+    r->help  = "Start with the counter on screen. F9 toggles it while playing.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.fps_overlay;
+    r++;
+
+    r->label = "Fullscreen";
+    r->help  = "Fill the screen, without a window frame. Alt+Enter switches in game.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.fullscreen;
+    r++;
+
+    r->label = "Variable refresh rate";
+    r->help  = "In fullscreen on a G-SYNC or FreeSync display: an even 60, no judder.";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.vrr;
+    r++;
+
+    r->label = "Frame interpolation";
+    r->help  = "Draw frames between the game's own: smoother motion while the game"
+               " still runs at 60. Best with Variable refresh rate.";
+    r->kind  = ROW_INT; r->lo = 1; r->hi = 4; r->ival = &g_settings.frame_interp;
+    r++;
+
+    g_video_count = (int)(r - g_video_rows);
+}
+
+static const char *link_mode_label(int i)
+{
+    switch (i) {
+    case LINK_HOST: return "Host a session";
+    case LINK_JOIN: return "Join a session";
+    case LINK_BY_HAND: return "udp (set in the settings file)";
+    default: return "Off";
+    }
+}
+
+static void build_link_rows(void)
+{
+    Row *r = g_link_rows;
+
+    memset(g_link_rows, 0, sizeof g_link_rows);
+
+    r->label = "System Link";
+    r->help  = "Play with other copies over a network. Host: this PC is the session"
+               " your friends join. Join: play in a friend's session.";
+    r->kind  = ROW_CHOICE; r->choices = k_link_modes; r->ival = &g_link_mode;
+    r++;
+
+    if (g_link_mode == LINK_JOIN) {
+        r->label = "Host's address";
+        r->help  = "What the host gave you, like 81.2.3.4 or a name, with :port if"
+                   " theirs is not the port below. Type it, or " LAUNCHER_PASTE_KEY " to paste.";
+        r->kind  = ROW_TEXT; r->text = g_settings.syslink_host;
+        r->text_len = sizeof g_settings.syslink_host; r->empty = "type the host's address";
+        r++;
+    }
+    if (g_link_mode == LINK_HOST || g_link_mode == LINK_JOIN) {
+        r->label = "Port";
+        r->help  = g_link_mode == LINK_HOST
+                   ? "The UDP port friends join on. Change it only if something else"
+                     " on this PC or your router already uses it."
+                   : "The host's port, when their address does not end in one.";
+        r->kind  = ROW_TEXT; r->text = g_port_text; r->text_len = sizeof g_port_text;
+        r->digits = 1; r->empty = "27610";
+        r++;
+
+        r->label = "Join code";
+        r->help  = "Optional. Only consoles with the same code get in; empty lets in"
+                   " anyone who has the address. Not case-sensitive.";
+        r->kind  = ROW_TEXT; r->text = g_settings.syslink_code;
+        r->text_len = sizeof g_settings.syslink_code; r->empty = "none";
+        r++;
+    }
+    if (g_link_mode == LINK_HOST) {
+        r->label = "Open the router";
+        r->help  = "Ask the router to forward the port to this PC (UPnP) while you"
+                   " host, so friends on the internet can join. Friends on your own"
+                   " network can join either way.";
+        r->kind  = ROW_BOOL; r->ival = &g_settings.syslink_upnp;
+        r++;
+    }
+    g_link_count = (int)(r - g_link_rows);
+}
+
+/* The port the host listens on as typed, or the default for anything that
+ * is not a port. */
+static int link_port(void)
+{
+    int p = atoi(g_port_text);
+
+    return (p >= 1 && p <= 65535) ? p : RECOMP_SYSLINK_DEFAULT_PORT;
+}
+
+#ifndef LAUNCHER_NO_WIDESCREEN
+/* Whether the file's own hor_plus, which settings_save keeps while the
+ * switch is where it was found, gives this game a different camera from
+ * the one the switch alone would. An older launcher's second switch left
+ * such files behind -- widescreen on with the camera not widened, or the
+ * camera widened with widescreen off -- and they are left meaning what
+ * they meant. But with one switch there is nowhere else to see that, so
+ * the row says so, and how to hand the camera back. */
+static int camera_overridden(void)
+{
+    RecompWidescreen kept, alone;
+    char factor[32];
+
+    if (g_widescreen != g_settings.widescreen || g_settings.hor_plus < 0.0)
+        return 0;
+    snprintf(factor, sizeof factor, "%g", g_settings.hor_plus);
+    recomp_widescreen_resolve_from(g_widescreen, factor, NULL,
+                                   recomp_widescreen_title_mode(), -1, &kept);
+    recomp_widescreen_resolve_from(g_widescreen, NULL, NULL,
+                                   recomp_widescreen_title_mode(), -1, &alone);
+    return kept.hor_plus != alone.hor_plus;
+}
+#endif
+
+static const char *row_help(const Row *r)
+{
+#ifndef LAUNCHER_NO_WIDESCREEN
+    if (r->ival == &g_widescreen && camera_overridden())
+        return "The settings file sets the camera's width itself (hor_plus). Switch"
+               " this off and on again to let the game decide.";
+#endif
+    return r->help;
+}
+
+static void row_value(const Row *r, char *out, size_t n)
+{
+    switch (r->kind) {
+    case ROW_BOOL:
+#ifndef LAUNCHER_NO_WIDESCREEN
+        if (r->ival == &g_widescreen && camera_overridden()) {
+            snprintf(out, n, "%s  (camera set in the settings file)",
+                     *r->ival ? "On" : "Off");
+            break;
+        }
+#endif
+        snprintf(out, n, "%s", *r->ival ? "On" : "Off");
+        break;
+    case ROW_INT:
+        if (r->ival == &g_settings.resolution_scale)
+            snprintf(out, n, *r->ival == 1 ? "Console (640x480)" : "%dx (%dx%d)",
+                     *r->ival, 640 * *r->ival, 480 * *r->ival);
+        else if (*r->ival == 1)
+            snprintf(out, n, "Off");
+        else if (r->ival == &g_settings.frame_interp)
+            snprintf(out, n, "%dx (%d frames a second)", *r->ival, 60 * *r->ival);
+        else
+            snprintf(out, n, "%dx", *r->ival);
+        break;
+    case ROW_CHOICE:
+        if (r->ival == &g_link_mode)
+            snprintf(out, n, "%s", link_mode_label(*r->ival));
+        else
+            snprintf(out, n, "%s", frame_cap_label(*r->ival));
+        break;
+    default:
+        snprintf(out, n, "%s", r->text ? r->text : "");
+        break;
+    }
+}
+
+static void row_move(Row *r, int delta)
+{
+    switch (r->kind) {
+    case ROW_BOOL:
+        *r->ival = !*r->ival;
+        break;
+    case ROW_INT:
+        *r->ival += delta;
+        if (*r->ival < r->lo) *r->ival = r->lo;
+        if (*r->ival > r->hi) *r->ival = r->hi;
+        break;
+    case ROW_CHOICE: {
+        int n = 0;
+        while (r->choices[n]) n++;
+        *r->ival = (*r->ival + delta + n) % n;
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+static int row_can(const Row *r, int delta)
+{
+    switch (r->kind) {
+    case ROW_INT:
+        return delta < 0 ? *r->ival > r->lo : *r->ival < r->hi;
+    case ROW_TEXT:
+        return 0;                       /* typed, not stepped: no arrows */
+    default:
+        return 1;
+    }
+}
+
+/* A key typed on a text row: printable characters go on the end, Backspace
+ * takes one off. */
+static void row_type(Row *r, unsigned ch)
+{
+    size_t len;
+
+    if (r->kind != ROW_TEXT || !r->text)
+        return;
+    len = strlen(r->text);
+    if (ch == 8) {
+        if (len)
+            r->text[len - 1] = '\0';
+    } else if (ch >= 32 && ch < 127 && len + 1 < r->text_len &&
+               (!r->digits || (ch >= '0' && ch <= '9'))) {
+        r->text[len] = (char)ch;
+        r->text[len + 1] = '\0';
+    }
+}
+
+static void row_paste(Row *r)
+{
+    char text[256];
+    const char *s;
+
+    if (r->kind != ROW_TEXT || !lhost_paste(text, sizeof text))
+        return;
+    /* The first line only, and only what could have been typed. */
+    for (s = text; *s && *s != '\r' && *s != '\n'; s++)
+        row_type(r, (unsigned char)*s);
+}
+
+/* ------------------------------------------------------------- the title */
+
+static char g_title_name[128] = "Xbox game";
+static uint32_t g_title_id;
+static char g_xbe_found[LAUNCHER_PATH]; /* empty: the game's files were not found */
+
+/* ------------------------------------------------- a self-building release */
+
+/* A release made by tools/release/make_release.py has release.json beside
+ * this launcher and no game: xboxrecomp-build (tools/builder) makes it from
+ * the player's own disc, in their folder for this title. The launcher then
+ * asks for the disc, runs the builder, draws its progress, and only after
+ * that shows the settings and Play -- which start the game the builder put
+ * in that folder. Without release.json nothing here changes anything. */
+static int  g_release;
+static char g_release_dir[LAUNCHER_PATH];
+static char g_release_exe[128];
+static char g_release_version[96];
+static char g_user_dir[LAUNCHER_PATH];   /* where the builder builds it */
+
+/* REL_DONE: built just now, and saying so until the player presses OK. */
+typedef enum { REL_READY, REL_SETUP, REL_BUILDING, REL_DONE } RelState;
+static RelState g_rel = REL_READY;
+static int    g_rel_stale;              /* built, but by an older release */
+static int    g_rel_moved;              /* built, but its files have gone */
+static int    g_rel_relinking;          /* the job is a relink, not a build */
+static char   g_source[LAUNCHER_PATH];  /* the disc: typed, picked or remembered */
+static char   g_rel_error[2048];
+static int    g_rel_unsupported;
+static char   g_rel_note[200];
+static double g_build_progress;
+static char   g_build_label[96], g_build_detail[200];
+static int    g_build_cancelled;
+static uint64_t g_build_started, g_build_ms; /* lhost_ticks; how long it took */
+static int    g_setup_sel;              /* 0 the path, 1 image, 2 folder, 3 build */
+
+static int read_small_file(const char *path, char *buf, size_t n)
+{
+    FILE *f = fopen(path, "rb");
+    size_t got;
+
+    if (!f)
+        return 0;
+    got = fread(buf, 1, n - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+    return 1;
+}
+
+/* A string field of a flat JSON object, unescaped: enough for release.json,
+ * the builder's own files and its progress lines, which this program and
+ * xboxrecomp-build write. 0 if the key is missing or not a string. */
+static int json_str(const char *text, const char *key, char *out, size_t n)
+{
+    char pat[96];
+    const char *p;
+    size_t k = 0;
+
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    p = strstr(text, pat);
+    if (!p || !n)
+        return 0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':' || *p == '\t')
+        p++;
+    if (*p++ != '"')
+        return 0;
+    while (*p && *p != '"' && k + 1 < n) {
+        char c = *p++;
+
+        if (c == '\\' && *p) {
+            c = *p++;
+            if (c == 'n') c = '\n';
+            else if (c == 't') c = ' ';
+            else if (c == 'u') {            /* \uXXXX: kept only if ASCII */
+                unsigned v = 0;
+                int i;
+                for (i = 0; i < 4 && *p; i++, p++)
+                    v = v * 16 + (unsigned)(*p <= '9' ? *p - '0' : (*p | 32) - 'a' + 10);
+                c = v < 0x80 ? (char)v : '?';
+            }
+        }
+        out[k++] = c;
+    }
+    out[k] = '\0';
+    return 1;
+}
+
+static double json_num(const char *text, const char *key)
+{
+    char pat[96];
+    const char *p;
+
+    snprintf(pat, sizeof pat, "\"%s\"", key);
+    p = strstr(text, pat);
+    if (!p)
+        return 0.0;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':')
+        p++;
+    return atof(p);
+}
+
+/* Where xboxrecomp-build builds this title: the same rule as its
+ * user_dir(), which owns it. */
+static int release_user_dir(uint32_t id, char *out, size_t n)
+{
+    const char *dir = getenv("XBOXRECOMP_BUILD_DIR");
+    const char *data = getenv("XDG_DATA_HOME");
+    const char *home = getenv("HOME");
+
+#if defined(_WIN32)
+    const char *local = getenv("LOCALAPPDATA");
+
+    (void)data; (void)home;
+    if (dir && *dir)
+        snprintf(out, n, "%s\\%08X", dir, id);
+    else if (local && *local)
+        snprintf(out, n, "%s\\xboxrecomp\\builds\\%08X", local, id);
+    else
+        return 0;
+    return 1;
+#endif
+    if (dir && *dir)
+        snprintf(out, n, "%s/%08X", dir, id);
+#if defined(__APPLE__)
+    else if (home && *home)
+        snprintf(out, n, "%s/Library/Application Support/xboxrecomp/builds/%08X", home, id);
+#endif
+    else if (data && *data)
+        snprintf(out, n, "%s/xboxrecomp/builds/%08X", data, id);
+    else if (home && *home)
+        snprintf(out, n, "%s/.local/share/xboxrecomp/builds/%08X", home, id);
+    else
+        return 0;
+    return 1;
+}
+
+/* Whether the game folder still reaches every file. A folder the player
+ * picked is linked, not copied (tools/builder, mirror_folder), so moving or
+ * deleting it leaves links to nothing; the builder's game_intact is the same
+ * test. On Windows the folders are junctions, and opening one follows it. */
+static int game_intact(void)
+{
+    char path[LAUNCHER_PATH + 300];
+    FILE *f;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE find, h;
+    int ok = 1;
+#else
+    DIR *dir;
+    struct dirent *e;
+    struct stat st;
+    int ok = 1;
+#endif
+
+    snprintf(path, sizeof path, "%s/game/default.xbe", g_user_dir);
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fclose(f);
+#ifndef _WIN32
+    snprintf(path, sizeof path, "%s/game", g_user_dir);
+    dir = opendir(path);
+    if (!dir)
+        return 0;
+    while (ok && (e = readdir(dir)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        snprintf(path, sizeof path, "%s/game/%s", g_user_dir, e->d_name);
+        ok = stat(path, &st) == 0;          /* follows the link */
+    }
+    closedir(dir);
+    return ok;
+#else
+    snprintf(path, sizeof path, "%s/game/*", g_user_dir);
+    find = FindFirstFileA(path, &fd);
+    if (find == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+            continue;
+        snprintf(path, sizeof path, "%s/game/%s", g_user_dir, fd.cFileName);
+        /* Backup semantics opens a folder; without OPEN_REPARSE_POINT the
+         * junction is followed, and fails when what it named is gone. */
+        h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        ok = h != INVALID_HANDLE_VALUE;
+        if (ok)
+            CloseHandle(h);
+    } while (ok && FindNextFileA(find, &fd));
+    FindClose(find);
+    return ok;
+#endif
+}
+
+/* What the builder has left: ready, built by another release, built with
+ * its files since moved, or not yet. */
+static void release_status(void)
+{
+    char path[LAUNCHER_PATH + 32], text[4096], built[96], exe[LAUNCHER_PATH];
+    FILE *f;
+
+    g_rel_stale = g_rel_moved = 0;
+    snprintf(path, sizeof path, "%s/source.json", g_user_dir);
+    if (!g_source[0] && read_small_file(path, text, sizeof text))
+        json_str(text, "path", g_source, sizeof g_source);
+    snprintf(path, sizeof path, "%s/build.json", g_user_dir);
+    if (!read_small_file(path, text, sizeof text) ||
+        !json_str(text, "release_version", built, sizeof built)) {
+        g_rel = REL_SETUP;
+        return;
+    }
+    snprintf(exe, sizeof exe, "%s/%s", g_user_dir, g_release_exe);
+    f = fopen(exe, "rb");
+    if (f)
+        fclose(f);
+    if (f && strcmp(built, g_release_version) == 0) {
+        g_rel = REL_READY;
+        if (!game_intact()) {
+            g_rel = REL_SETUP;
+            g_rel_moved = 1;
+        }
+    } else {
+        g_rel = REL_SETUP;
+        g_rel_stale = 1;
+    }
+}
+
+#if defined(__APPLE__)
+static int g_rel_translocated;      /* run from a read-only copy: see below */
+
+static int unquarantine_one(const char *path, const struct stat *st, int type, struct FTW *ftw)
+{
+    (void)st; (void)type; (void)ftw;
+    removexattr(path, "com.apple.quarantine", XATTR_NOFOLLOW);
+    return 0;
+}
+
+/* A Mac release is not signed with a Developer ID, so a downloaded one is
+ * quarantined, every file of it, and macOS would refuse each tool the
+ * build starts (the builder, zig, CMake, Python) as it started them. The
+ * player has already chosen to open this application, so its own files
+ * lose the flag here, as the xattr command in its README.txt would do.
+ *
+ * Opened where it was unpacked, before it has been moved, macOS runs it
+ * from a translocated, read-only copy instead, which cannot be changed and
+ * would not keep the change: the player is asked to move it first. */
+static void release_unquarantine(void)
+{
+    static const char tail[] = "/Contents/Resources";
+    char app[LAUNCHER_PATH], builder[LAUNCHER_PATH + 64];
+    size_t n = strlen(g_release_dir);
+
+    snprintf(builder, sizeof builder, "%s/bin/xboxrecomp-build", g_release_dir);
+    if (getxattr(builder, "com.apple.quarantine", NULL, 0, 0, XATTR_NOFOLLOW) < 0)
+        return;                                 /* nothing to do */
+    if (n < sizeof tail || strcmp(g_release_dir + n - (sizeof tail - 1), tail) != 0)
+        return;
+    snprintf(app, sizeof app, "%.*s", (int)(n - (sizeof tail - 1)), g_release_dir);
+    if (strstr(app, "/AppTranslocation/")) {
+        g_rel_translocated = 1;
+        return;
+    }
+    nftw(app, unquarantine_one, 32, FTW_PHYS);
+}
+
+/* What the player is told while it is translocated, instead of building. */
+static int release_translocated_error(void)
+{
+    if (!g_rel_translocated)
+        return 0;
+    snprintf(g_rel_error, sizeof g_rel_error,
+             "macOS is running this copy of %s from a temporary, read-only place, "
+             "so it cannot build the game. Quit, move it to Applications (or any "
+             "folder) in Finder, and open it again.", g_title_name);
+    return 1;
+}
+#endif
+
+static void release_init(void)
+{
+    char path[LAUNCHER_PATH + 32], text[8192], id[16];
+
+    if (!host_exe_path(g_release_dir, sizeof g_release_dir))
+        return;
+    host_path_dirname(g_release_dir);
+    snprintf(path, sizeof path, "%s/release.json", g_release_dir);
+#if defined(__APPLE__)
+    /* A Mac release is an application: this is Contents/MacOS, and the
+     * release is in Contents/Resources (tools/release/make_release.py). */
+    if (!read_small_file(path, text, sizeof text)) {
+        size_t len = strlen(g_release_dir);
+        if (len >= 6 && strcmp(g_release_dir + len - 6, "/MacOS") == 0) {
+            snprintf(g_release_dir + len - 5, sizeof g_release_dir - (len - 5), "Resources");
+            snprintf(path, sizeof path, "%s/release.json", g_release_dir);
+        }
+    }
+#endif
+    if (!read_small_file(path, text, sizeof text) ||
+        !json_str(text, "title_id", id, sizeof id) ||
+        !json_str(text, "exe", g_release_exe, sizeof g_release_exe))
+        return;
+    g_release = 1;
+#ifdef _WIN32
+    /* release.json names the target; Windows names its file .exe. */
+    if (strlen(g_release_exe) + 5 <= sizeof g_release_exe)
+        strcat(g_release_exe, ".exe");
+#endif
+    g_title_id = (uint32_t)strtoul(id, NULL, 16);
+    json_str(text, "title_name", g_title_name, sizeof g_title_name);
+    json_str(text, "version", g_release_version, sizeof g_release_version);
+    if (!release_user_dir(g_title_id, g_user_dir, sizeof g_user_dir)) {
+        g_rel = REL_SETUP;
+        snprintf(g_rel_error, sizeof g_rel_error,
+                 "There is no home folder to build the game in (HOME is not set).");
+        return;
+    }
+    release_status();
+#if defined(__APPLE__)
+    release_unquarantine();
+    if (g_rel != REL_READY)
+        release_translocated_error();
+#endif
+}
+
+/* The name and id out of the game's own XBE, so the launcher says what it
+ * launches without being told at build time -- and, more to the point, so
+ * it writes the settings file the game will read, which is named after the
+ * title id. A launcher that cannot find the XBE writes default.conf, which
+ * the game never reads, so every setting chosen here would quietly do
+ * nothing.
+ *
+ * Looked for exactly where the game's find_game() looks, in its order:
+ * RECOMP_GAME_DIR alone if it is set; on macOS, from inside an application
+ * bundle, a "game" folder beside the bundle, then one in its Resources; else
+ * a "game" folder beside the executable, else the title's YOUR_GAME_DIR
+ * (LAUNCHER_GAME_DIR, read out of its main.c by recomp_add_launcher), else
+ * that one level up, for a single-configuration build -- all relative to
+ * this executable, not the working directory, as the game's are. And the
+ * XBE read is the one the game boots (LAUNCHER_GAME_XBE): a disc whose
+ * default.xbe only picks a language has the title's id there but no name. */
+static int read_cert(const char *xbe)
+{
+    FILE *f = fopen(xbe, "rb");
+    unsigned char head[0x200], cert[0xA4];
+    uint32_t cert_va, base_va, off;
+
+    if (!f)
+        return 0;
+    if (fread(head, 1, sizeof head, f) != sizeof head) { fclose(f); return 0; }
+    base_va = *(uint32_t *)(head + 0x0104);
+    cert_va = *(uint32_t *)(head + 0x0118);
+    if (cert_va < base_va) { fclose(f); return 0; }
+    off = cert_va - base_va;
+    if (fseek(f, (long)off, SEEK_SET) != 0 ||
+        fread(cert, 1, sizeof cert, f) != sizeof cert) { fclose(f); return 0; }
+    fclose(f);
+
+    g_title_id = *(uint32_t *)(cert + 0x08);
+    {   /* wszTitleName: 40 UTF-16 units at +0x0C, padded not terminated */
+        int j, k = 0;
+        for (j = 0; j < 40 && k < (int)sizeof g_title_name - 1; j++) {
+            unsigned c = cert[0x0C + j * 2] | (cert[0x0C + j * 2 + 1] << 8);
+            if (!c) break;
+            if (c < 0x80) g_title_name[k++] = (char)c;
+        }
+        while (k > 0 && g_title_name[k - 1] == ' ') k--;
+        g_title_name[k] = '\0';
+        if (!k) snprintf(g_title_name, sizeof g_title_name, "Xbox game");
+    }
+    lhost_full_path(xbe, g_xbe_found, sizeof g_xbe_found);
+    return 1;
+}
+
+static void read_title(void)
+{
+    const char *env = getenv("RECOMP_GAME_DIR");
+    char dir[LAUNCHER_PATH], xbe[LAUNCHER_PATH + 64], app[LAUNCHER_PATH];
+
+    /* A release's game is the one its builder made; until there is one, the
+     * name and id are release.json's. */
+    if (g_release) {
+        snprintf(xbe, sizeof xbe, "%s/game/" LAUNCHER_GAME_XBE, g_user_dir);
+        read_cert(xbe);
+        return;
+    }
+
+    /* Set means only this, as it does for the game: finding the XBE
+     * somewhere else would name a settings file for a different copy.
+     * Forward slashes throughout, which Windows takes as well. */
+    if (env && *env) {
+        snprintf(xbe, sizeof xbe, "%s/" LAUNCHER_GAME_XBE, env);
+        read_cert(xbe);
+        return;
+    }
+
+    if (host_app_bundle_dir(app, sizeof app)) {
+        snprintf(dir, sizeof dir, "%s", app);
+        host_path_dirname(dir);
+        snprintf(xbe, sizeof xbe, "%s/game/" LAUNCHER_GAME_XBE, dir);
+        if (read_cert(xbe))
+            return;
+        snprintf(xbe, sizeof xbe, "%s/Contents/Resources/game/" LAUNCHER_GAME_XBE, app);
+        if (read_cert(xbe))
+            return;
+    }
+
+    if (!host_exe_path(dir, sizeof dir))
+        return;
+    host_path_dirname(dir);
+
+    snprintf(xbe, sizeof xbe, "%s/game/" LAUNCHER_GAME_XBE, dir);
+    if (read_cert(xbe))
+        return;
+#ifdef LAUNCHER_GAME_DIR
+    snprintf(xbe, sizeof xbe, "%s/%s/" LAUNCHER_GAME_XBE, dir, LAUNCHER_GAME_DIR);
+    if (read_cert(xbe))
+        return;
+    if (strncmp(LAUNCHER_GAME_DIR, "../", 3) == 0) {
+        snprintf(xbe, sizeof xbe, "%s/%s/" LAUNCHER_GAME_XBE, dir, &LAUNCHER_GAME_DIR[3]);
+        read_cert(xbe);
+    }
+#endif
+}
+
+/* ------------------------------------------------------------- capture */
+
+/* What is pressed right now, as a source string, or NULL. Reads the pad
+ * and the keyboard together: which one a person reaches for is the
+ * answer to "what do you want this to be", and asking them to say first
+ * is a question with no purpose.
+ *
+ * Sticks count as four directions rather than two axes, because that is
+ * what the file binds and what a person means when they push one. */
+static const char *capture_pad(int pad_index)
+{
+    static char out[BIND_SOURCE_LEN];
+    RecompPadState st;
+    static const struct { uint16_t mask; const char *name; } k_buttons[] = {
+        { RECOMP_PAD_A, "a" }, { RECOMP_PAD_B, "b" },
+        { RECOMP_PAD_X, "x" }, { RECOMP_PAD_Y, "y" },
+        { RECOMP_PAD_LEFT_SHOULDER, "lshoulder" },
+        { RECOMP_PAD_RIGHT_SHOULDER, "rshoulder" },
+        { RECOMP_PAD_START, "start" }, { RECOMP_PAD_BACK, "back" },
+        { RECOMP_PAD_LEFT_THUMB, "lthumb" },
+        { RECOMP_PAD_RIGHT_THUMB, "rthumb" },
+        { RECOMP_PAD_DPAD_UP, "dpad_up" },
+        { RECOMP_PAD_DPAD_DOWN, "dpad_down" },
+        { RECOMP_PAD_DPAD_LEFT, "dpad_left" },
+        { RECOMP_PAD_DPAD_RIGHT, "dpad_right" },
+        { 0, NULL }
+    };
+    const int16_t push = 22000;           /* well past any resting stick */
+    int i;
+
+    if (!recomp_pad_read(pad_index, &st))
+        return NULL;
+
+    for (i = 0; k_buttons[i].name; i++)
+        if (st.buttons & k_buttons[i].mask) {
+            snprintf(out, sizeof out, "pad:%s", k_buttons[i].name);
+            return out;
+        }
+    if (st.left_trigger > 160)  { snprintf(out, sizeof out, "pad:lt"); return out; }
+    if (st.right_trigger > 160) { snprintf(out, sizeof out, "pad:rt"); return out; }
+
+    if (st.lx >  push) { snprintf(out, sizeof out, "pad:lx+"); return out; }
+    if (st.lx < -push) { snprintf(out, sizeof out, "pad:lx-"); return out; }
+    if (st.ly >  push) { snprintf(out, sizeof out, "pad:ly+"); return out; }
+    if (st.ly < -push) { snprintf(out, sizeof out, "pad:ly-"); return out; }
+    if (st.rx >  push) { snprintf(out, sizeof out, "pad:rx+"); return out; }
+    if (st.rx < -push) { snprintf(out, sizeof out, "pad:rx-"); return out; }
+    if (st.ry >  push) { snprintf(out, sizeof out, "pad:ry+"); return out; }
+    if (st.ry < -push) { snprintf(out, sizeof out, "pad:ry-"); return out; }
+    return NULL;
+}
+
+/* The key names the runtime knows by name; everything else is a letter
+ * or a digit and spells itself. Escape is not offered: it is how a
+ * person gets out of the capture. */
+static const struct { int key; const char *name; } k_named_keys[] = {
+    { LKEY_RETURN, "RETURN" }, { LKEY_BACK, "BACK" }, { LKEY_SPACE, "SPACE" },
+    { LKEY_TAB, "TAB" }, { LKEY_UP, "UP" }, { LKEY_DOWN, "DOWN" },
+    { LKEY_LEFT, "LEFT" }, { LKEY_RIGHT, "RIGHT" },
+    { LKEY_LSHIFT, "LSHIFT" }, { LKEY_RSHIFT, "RSHIFT" },
+    { LKEY_LCTRL, "LCTRL" }, { LKEY_RCTRL, "RCTRL" },
+    { 0, NULL }
+};
+
+static const char *capture_key(void)
+{
+    static char out[BIND_SOURCE_LEN];
+    int i, vk;
+
+    for (i = 0; k_named_keys[i].name; i++)
+        if (lhost_key_held(k_named_keys[i].key)) {
+            snprintf(out, sizeof out, "key:%s", k_named_keys[i].name);
+            return out;
+        }
+    for (vk = 'A'; vk <= 'Z'; vk++)
+        if (lhost_key_held(vk)) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    for (vk = '0'; vk <= '9'; vk++)
+        if (lhost_key_held(vk)) {
+            snprintf(out, sizeof out, "key:%c", (char)vk);
+            return out;
+        }
+    return NULL;
+}
+
+/* The name a "mouse:" source gives each LMOUSE_* button. */
+static const char *mouse_source(int button)
+{
+    switch (button) {
+    case LMOUSE_LEFT:   return "mouse:left";
+    case LMOUSE_RIGHT:  return "mouse:right";
+    case LMOUSE_MIDDLE: return "mouse:middle";
+    case LMOUSE_X1:     return "mouse:x1";
+    case LMOUSE_X2:     return "mouse:x2";
+    default:            return NULL;
+    }
+}
+
+/* The control the selected row binds, or -1 on a head row. */
+static int capture_control(void)
+{
+    int k = g_bind_top + g_sel - BIND_HEAD_ROWS;
+
+    return (k >= 0 && k < BIND_CONTROLS) ? k : -1;
+}
+
+/* Nothing at all held. Entering the capture with A still down would
+ * otherwise bind A to whatever the person was trying to rebind. */
+static int everything_released(int pad_index)
+{
+    return capture_pad(pad_index) == NULL && capture_key() == NULL &&
+           !lhost_key_held(LKEY_ESCAPE);
+}
+
+static void capture_tick(void)
+{
+    const BindPort *bp = &g_bind.port[g_bind_port];
+    int pad = bp->device == BIND_DEV_PAD ? bp->pad : 0;
+    const char *got;
+
+    if (!g_capture_armed) {
+        g_capture_armed = everything_released(pad);
+        return;
+    }
+    if (lhost_key_held(LKEY_ESCAPE)) {
+        g_capturing = 0;
+        return;
+    }
+    got = (g_bind_col == 0) ? capture_pad(pad) : capture_key();
+    if (!got)
+        return;
+
+    {
+        int k = capture_control();
+
+        if (k >= 0) {
+            char *dst = (g_bind_col == 0) ? g_bind.port[g_bind_port].pad_src[k]
+                                          : g_bind.port[g_bind_port].key_src[k];
+            snprintf(dst, BIND_SOURCE_LEN, "%s", got);
+            g_bind_dirty = 1;
+        }
+    }
+    g_capturing = 0;
+}
+
+/* A mouse button while a binding waits for its answer. In the keyboard
+ * and mouse column it is the answer, whichever button; in the pad column
+ * it is not something a pad can do, so it gives up, as Escape does. The
+ * press that started the capture arrived before it did, and a button
+ * still held from it sends no second press, so it cannot bind itself. */
+static int capture_mouse(int button)
+{
+    const char *got = mouse_source(button);
+    int k = capture_control();
+
+    if (!g_capturing)
+        return 0;
+    if (!g_capture_armed)
+        return 1;                       /* still waiting for a clean start */
+    if (g_bind_col == 1 && got && k >= 0) {
+        snprintf(g_bind.port[g_bind_port].key_src[k], BIND_SOURCE_LEN, "%s", got);
+        g_bind_dirty = 1;
+    }
+    g_capturing = 0;
+    return 1;
+}
+
+/* ------------------------------------------------------------ persistence */
+
+static void settings_load(void)
+{
+    char path[1024];
+
+    recomp_settings_defaults(&g_settings);
+    if (recomp_settings_path(g_title_id, path, sizeof path))
+        recomp_settings_read(path, &g_settings);
+
+    g_widescreen = g_settings.widescreen;
+    k_frame_caps = recomp_title_keeps_time() ? k_frame_caps_time : k_frame_caps_console;
+    g_frame_cap_index = 0;
+    {
+        int i;
+        for (i = 0; k_frame_caps[i]; i++)
+            if (strcasecmp(g_settings.frame_cap, k_frame_caps[i]) == 0) {
+                g_frame_cap_index = i;
+                break;
+            }
+    }
+
+    g_link_mode = LINK_OFF;
+    {
+        int i;
+        for (i = 0; k_link_modes[i]; i++)
+            if (strcasecmp(g_settings.syslink, k_link_modes[i]) == 0)
+                g_link_mode = i;
+    }
+    /* A pair set up by hand is left as it is unless the row is moved. */
+    if (strcasecmp(g_settings.syslink, "udp") == 0)
+        g_link_mode = LINK_BY_HAND;
+    snprintf(g_port_text, sizeof g_port_text, "%d", g_settings.syslink_port);
+    build_link_rows();
+}
+
+static void bindings_load(void)
+{
+    char path[1024];
+
+    bind_defaults(&g_bind);
+    if (bind_config_path(path, sizeof path))
+        bind_load(path, &g_bind);
+    recomp_pad_set_api(g_bind.pad_api == BIND_PAD_API_XINPUT
+                       ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
+    g_bind_dirty = 0;
+}
+
+static void bindings_save(void)
+{
+    char path[1024];
+
+    if (g_bind_dirty && bind_config_path(path, sizeof path))
+        if (bind_save(path, &g_bind))
+            g_bind_dirty = 0;
+}
+
+static int settings_save(void)
+{
+    char path[1024];
+
+#ifdef LAUNCHER_NO_WIDESCREEN
+    /* Not offered, so not left on by an older file either. */
+    g_settings.widescreen = 0;
+    g_settings.hor_plus = 0.0;
+#else
+    /* The file holds more than the switch: how far the camera is widened
+     * and which register its projection is in. Neither is asked for here --
+     * a player should not have to know that 0.75 is (4/3)/(16/9), nor have
+     * any way to choose a per-game constant -- and neither is overwritten
+     * unless the switch was moved, so a value set by hand in the file
+     * survives every Play. */
+    recomp_settings_set_widescreen(&g_settings, g_widescreen);
+#endif
+    snprintf(g_settings.frame_cap, sizeof g_settings.frame_cap, "%s",
+             k_frame_caps[g_frame_cap_index]);
+    if (g_link_mode != LINK_BY_HAND)
+        snprintf(g_settings.syslink, sizeof g_settings.syslink, "%s",
+                 k_link_modes[g_link_mode]);
+    g_settings.syslink_port = link_port();
+
+    if (!recomp_settings_path(g_title_id, path, sizeof path))
+        return 0;
+    return recomp_settings_write(path, &g_settings);
+}
+
+/* ---------------------------------------------------------------- launch */
+
+static int launch_game(void)
+{
+    char exe[LAUNCHER_PATH + 64], dir[LAUNCHER_PATH];
+
+    /* A release's game is in the player's folder, beside its game files. */
+    if (g_release) {
+        snprintf(exe, sizeof exe, "%s/%s", g_user_dir, g_release_exe);
+        return lhost_launch(exe, g_user_dir);
+    }
+
+    /* Beside this executable, whatever the working directory is: a
+     * shortcut on a desktop must work as well as a double-click. */
+    if (!host_exe_path(dir, sizeof dir))
+        dir[0] = '\0';
+    host_path_dirname(dir);
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\%s", dir, LAUNCHER_GAME_EXE);
+#else
+    snprintf(exe, sizeof exe, "%s/%s", dir, LAUNCHER_GAME_EXE);
+#endif
+    return lhost_launch(exe, dir);
+}
+
+/* ------------------------------------------------------------------- pad */
+
+/* A pad held in a direction should repeat, but not instantly and not at
+ * the polling rate, or one nudge runs the value to its end. */
+typedef struct PadNav {
+    uint16_t last;
+    uint64_t held_since, last_repeat;
+    int      last_dir_x, last_dir_y;
+} PadNav;
+
+static PadNav g_pad;
+
+#define PAD_REPEAT_DELAY 380
+#define PAD_REPEAT_RATE  110
+
+static int pad_axis(int16_t v)
+{
+    const int16_t dead = 16000;
+    return v > dead ? 1 : (v < -dead ? -1 : 0);
+}
+
+/* Fills dx/dy/accept/cancel/tab with edges: each is non-zero for one
+ * frame per press, or repeatedly while a direction is held. */
+static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
+{
+    RecompPadState st;
+    uint64_t now = lhost_ticks();
+    uint16_t b;
+    int x, y, i, connected = 0;
+
+    *dx = *dy = *accept = *cancel = *tab = 0;
+
+    memset(&st, 0, sizeof st);
+    for (i = 0; i < RECOMP_PAD_SLOTS; i++)
+        if (recomp_pad_read(i, &st)) { connected = 1; break; }
+    if (!connected) {
+        g_pad.last = 0;
+        return 0;
+    }
+
+    b = st.buttons;
+    x = pad_axis(st.lx);
+    y = -pad_axis(st.ly);                          /* screen y grows downward */
+    if (b & RECOMP_PAD_DPAD_LEFT)  x = -1;
+    if (b & RECOMP_PAD_DPAD_RIGHT) x = 1;
+    if (b & RECOMP_PAD_DPAD_UP)    y = -1;
+    if (b & RECOMP_PAD_DPAD_DOWN)  y = 1;
+
+    if (x != g_pad.last_dir_x || y != g_pad.last_dir_y) {
+        g_pad.last_dir_x = x;
+        g_pad.last_dir_y = y;
+        g_pad.held_since = now;
+        g_pad.last_repeat = now;
+        *dx = x;
+        *dy = y;
+    } else if ((x || y) && now - g_pad.held_since > PAD_REPEAT_DELAY &&
+               now - g_pad.last_repeat > PAD_REPEAT_RATE) {
+        g_pad.last_repeat = now;
+        *dx = x;
+        *dy = y;
+    }
+
+    /* Buttons on the press, not the release. */
+    if ((b & RECOMP_PAD_A) && !(g_pad.last & RECOMP_PAD_A)) *accept = 1;
+    if ((b & RECOMP_PAD_B) && !(g_pad.last & RECOMP_PAD_B)) *cancel = 1;
+    if ((b & RECOMP_PAD_RIGHT_SHOULDER) &&
+        !(g_pad.last & RECOMP_PAD_RIGHT_SHOULDER)) *tab = 1;
+    if ((b & RECOMP_PAD_LEFT_SHOULDER) &&
+        !(g_pad.last & RECOMP_PAD_LEFT_SHOULDER)) *tab = -1;
+    if ((b & RECOMP_PAD_START) && !(g_pad.last & RECOMP_PAD_START)) *accept = 1;
+
+    g_pad.last = b;
+    return 1;
+}
+
+/* ----------------------------------------------------------------- state */
+
+typedef enum { TAB_VIDEO, TAB_INPUT, TAB_LINK, TAB_ABOUT, TAB_COUNT } Tab;
+static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "SYSTEM LINK", "ABOUT" };
+
+static Tab    g_tab;
+static Tab    g_tab_from;
+static double g_tab_t = 1.0;
+static int    g_rows_on_tab;
+static double g_pulse;
+static int    g_pad_seen;
+
+/* The list of settings rows on this tab, or NULL for a tab without one. */
+static Row *tab_rows(int *count)
+{
+    if (g_tab == TAB_VIDEO) {
+        *count = g_video_count;
+        return g_video_rows;
+    }
+    if (g_tab == TAB_LINK) {
+        *count = g_link_count;
+        return g_link_rows;
+    }
+    *count = 0;
+    return NULL;
+}
+
+/* ---- the System Link tab's addresses ---- */
+
+static void probe_thread(void)
+{
+    net_upnp_probe(&g_probe);
+    lhost_publish(&g_probe_state, 2);
+}
+
+/* While the tab is showing: this PC's address, once, and -- for a host that
+ * lets the router be asked -- the router's internet address, asked once on a
+ * thread of its own, since a router that does not answer takes two seconds
+ * to say so. Nothing is opened from here; the game does that while it hosts. */
+static void link_tab_tick(void)
+{
+    if (!g_lan_addr[0] && !net_local_address(g_lan_addr, sizeof g_lan_addr))
+        snprintf(g_lan_addr, sizeof g_lan_addr, "?");
+    /* Only this thread moves it off 0, so asking and starting are one. */
+    if (g_link_mode == LINK_HOST && g_settings.syslink_upnp &&
+        lhost_read(&g_probe_state) == 0) {
+        lhost_publish(&g_probe_state, 1);
+        if (!lhost_thread(probe_thread))
+            lhost_publish(&g_probe_state, 0);
+    }
+}
+
+/* What a host tells its friends: the internet address when the router gave
+ * one, else this PC's address on its own network. */
+static void link_share_address(char *out, size_t n)
+{
+    if (g_settings.syslink_upnp && lhost_read(&g_probe_state) == 2 &&
+        g_probe.state == NET_UPNP_FOUND)
+        snprintf(out, n, "%s:%d", g_probe.external, link_port());
+    else
+        snprintf(out, n, "%s:%d", g_lan_addr, link_port());
+}
+
+static void copy_text(const char *s)
+{
+    if (lhost_copy(s))
+        g_copied_until = lhost_ticks() + 1500;
+}
+
+/* After the mode row moved: the list is a different length now. */
+static void link_rows_changed(void)
+{
+    build_link_rows();
+    if (g_sel >= g_link_count)
+        g_sel = g_link_count - 1;
+}
+
+static ThemeRect tab_rect(int i)
+{
+    ThemeRect r;
+    r.w = 130;
+    r.h = 40;
+    r.x = 60 + i * (r.w + 14);
+    r.y = 92;
+    return r;
+}
+
+static ThemeRect row_rect(int i)
+{
+    ThemeRect r;
+    r.x = 60;
+    r.y = 168 + i * 62;
+    r.w = g_cw - 120;
+    r.h = 52;
+    return r;
+}
+
+/* Where a row's arrows are drawn: theme_arrows puts the left one at this
+ * box's left edge and the right one at its right edge. Drawing and clicking
+ * both come from here -- the click test once kept its own numbers, which
+ * put the drawn left arrow inside its "right" zone, so clicking it moved a
+ * setting the wrong way. */
+static ThemeRect arrows_rect(ThemeRect row)
+{
+    ThemeRect a = row;
+
+    a.x = row.x + row.w - 46;
+    a.w = 30;
+    return a;
+}
+
+/* Which arrow a click at mx on this row means: -1 the left, +1 the right,
+ * 0 neither. Each target is half the arrows' box, stretched outward -- the
+ * left back to where the value column ends, the right out to the row's
+ * edge -- so a 7-pixel triangle is not all there is to hit. */
+static int hit_arrow(ThemeRect row, int mx)
+{
+    ThemeRect a = arrows_rect(row);
+    int mid = a.x + a.w / 2;
+
+    if (mx >= row.x + row.w - 60 && mx < mid)
+        return -1;
+    if (mx >= mid && mx < row.x + row.w)
+        return 1;
+    return 0;
+}
+
+static void set_tab(Tab t)
+{
+    if (t == g_tab)
+        return;
+    g_tab_from = g_tab;
+    g_tab = t;
+    g_tab_t = 0.0;
+    g_sel = 0;
+}
+
+static void rows_for_tab(void)
+{
+    g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
+                  : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE
+                  : (g_tab == TAB_LINK)  ? g_link_count : 0;
+    if (g_sel >= g_rows_on_tab)
+        g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
+}
+
+static void do_play(void)
+{
+    settings_save();
+    bindings_save();
+    if (launch_game())
+        lhost_close();
+}
+
+/* The input list is longer than the screen, so moving off either end
+ * scrolls it rather than wrapping: a list that wraps from "A" to "right
+ * stick press" is a list nobody can walk down. */
+static void input_move(int dy)
+{
+    int k = g_bind_top + g_sel + dy;
+
+    if (k < 0) k = 0;
+    if (k >= BIND_TOTAL_ROWS) k = BIND_TOTAL_ROWS - 1;
+    if (k < g_bind_top)
+        g_bind_top = k;
+    else if (k >= g_bind_top + BIND_ROWS_VISIBLE)
+        g_bind_top = k - BIND_ROWS_VISIBLE + 1;
+    g_sel = k - g_bind_top;
+}
+
+static void setup_nav(int dx, int dy, int accept, int cancel);
+static void home_nav(int dx, int dy, int accept, int cancel);
+static void back_or_quit(void);
+static int g_home;
+
+static void nav(int dx, int dy, int accept, int cancel, int tabdelta)
+{
+    if (g_release && g_rel != REL_READY) {
+        setup_nav(dx, dy, accept, cancel);
+        return;
+    }
+    if (g_capturing) {
+        /* While waiting for a press, nothing else means anything: the
+         * press is the answer. Cancel is handled in capture_tick, which
+         * watches Escape and the pad together. */
+        if (cancel)
+            g_capturing = 0;
+        return;
+    }
+    if (g_home) {
+        home_nav(dx, dy, accept, cancel);
+        return;
+    }
+    if (tabdelta)
+        set_tab((Tab)((g_tab + tabdelta + TAB_COUNT) % TAB_COUNT));
+
+    if (g_tab == TAB_INPUT) {
+        int k = g_bind_top + g_sel;
+
+        if (dy) {
+            input_move(dy);
+            return;
+        }
+        if (k == BIND_ROW_PORT) {
+            if (dx) {
+                g_bind_port = (g_bind_port + dx + BIND_PORTS) % BIND_PORTS;
+                g_bind_col = 0;
+            }
+        } else if (k == BIND_ROW_DEVICE) {
+            if (dx) {
+                /* One list, in the order a person would try them:
+                 * the four pads, then the keyboard, then nothing. */
+                BindPort *bp = &g_bind.port[g_bind_port];
+                int cur = (bp->device == BIND_DEV_PAD) ? bp->pad
+                        : (bp->device == BIND_DEV_KEYBOARD) ? BIND_PORTS
+                        : BIND_PORTS + 1;
+
+                cur = (cur + dx + BIND_PORTS + 2) % (BIND_PORTS + 2);
+                if (cur < BIND_PORTS) {
+                    bp->device = BIND_DEV_PAD;
+                    bp->pad = cur;
+                } else if (cur == BIND_PORTS) {
+                    bp->device = BIND_DEV_KEYBOARD;
+                    bp->pad = -1;
+                } else {
+                    bp->device = BIND_DEV_NONE;
+                    bp->pad = -1;
+                }
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_API) {
+            if (dx || accept) {
+                g_bind.pad_api = g_bind.pad_api == BIND_PAD_API_XINPUT
+                                 ? BIND_PAD_API_SDL : BIND_PAD_API_XINPUT;
+                recomp_pad_set_api(g_bind.pad_api == BIND_PAD_API_XINPUT
+                                   ? RECOMP_PAD_API_XINPUT : RECOMP_PAD_API_SDL);
+                g_bind_dirty = 1;
+            }
+        } else if (k == BIND_ROW_MOUSE) {
+            if (dx || accept)
+                g_settings.mouse_look = !g_settings.mouse_look;
+        } else if (k == BIND_ROW_SENS) {
+            g_settings.mouse_sensitivity += dx;
+            if (g_settings.mouse_sensitivity < RECOMP_MOUSE_SENSITIVITY_MIN)
+                g_settings.mouse_sensitivity = RECOMP_MOUSE_SENSITIVITY_MIN;
+            if (g_settings.mouse_sensitivity > RECOMP_MOUSE_SENSITIVITY_MAX)
+                g_settings.mouse_sensitivity = RECOMP_MOUSE_SENSITIVITY_MAX;
+            /* Back to the default, the one value worth finding again. */
+            if (accept)
+                g_settings.mouse_sensitivity = RECOMP_MOUSE_SENSITIVITY_DEFAULT;
+        } else if (k == BIND_ROW_RESET) {
+            if (accept) {
+                BindConfig d;
+
+                /* This controller only: a person resetting controller 2
+                 * has said nothing about the other three. */
+                bind_defaults(&d);
+                g_bind.port[g_bind_port] = d.port[g_bind_port];
+                g_bind_dirty = 1;
+            }
+        } else {
+            if (dx)
+                g_bind_col = g_bind_col ? 0 : 1;
+            if (accept) {
+                g_capturing = 1;
+                g_capture_armed = 0;    /* wait for the accept to be let go */
+            }
+        }
+        if (cancel)
+            back_or_quit();
+        return;
+    }
+
+    if (dy && g_rows_on_tab)
+        g_sel = (g_sel + dy + g_rows_on_tab) % g_rows_on_tab;
+    if (dx && g_rows_on_tab) {
+        int count;
+        Row *rows = tab_rows(&count);
+
+        if (rows && g_sel < count) {
+            row_move(&rows[g_sel], dx);
+            if (g_tab == TAB_LINK)
+                link_rows_changed();
+        }
+    }
+    if (accept)
+        do_play();
+    if (cancel)
+        back_or_quit();
+}
+
+/* ------------------------------------------------------------------ draw */
+
+/* A list of settings rows and the selected one's explanation under it, as
+ * the Video and System Link tabs both show them: on one line, or wrapped
+ * for the System Link tab's longer ones. Returns the y below. */
+static int draw_rows(const Row *rows, int count, int wrap_help)
+{
+    ThemeRect r;
+    char value[160];
+    int i;
+
+    for (i = 0; i < count; i++) {
+        const Row *row = &rows[i];
+        ThemeRect rr = row_rect(i), lr, vr, ar;
+        double lit = (i == g_sel) ? 1.0 : 0.0;
+        int dim_value = 0;
+
+        theme_panel(rr, lit);
+
+        lr = rr; lr.x += 22; lr.w = 260;
+        theme_text(lr, row->label, 13, 600,
+                   lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+
+        row_value(row, value, sizeof value);
+        if (row->kind == ROW_TEXT) {
+            /* A cursor on the row being typed into; the hint on an empty
+             * one that is not. */
+            if (lit > 0.5) {
+                if ((int)(g_pulse * 6.0) % 2 == 0)
+                    strncat(value, "_", sizeof value - strlen(value) - 1);
+            } else if (!value[0] && row->empty) {
+                snprintf(value, sizeof value, "%s", row->empty);
+                dim_value = 1;
+            }
+        }
+        vr = rr; vr.x += 300; vr.w = rr.w - 360;
+        if (row->kind == ROW_BOOL && theme_branded()) {
+            /* A switch rather than On / Off, and whatever the value says
+             * beyond that (a camera set in the file) beside it. */
+            ThemeRect sw = vr;
+            const char *rest = strstr(value, "  (");
+
+            sw.w = 48; sw.h = 26; sw.y = rr.y + (rr.h - sw.h) / 2;
+            theme_switch(sw, *row->ival != 0, lit);
+            if (rest) {
+                vr.x += 62; vr.w -= 62;
+                theme_text(vr, rest + 2, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+            }
+            continue;
+        }
+        theme_text(vr, value, 13, 400,
+                   (lit > 0.5 && !dim_value) ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+
+        ar = arrows_rect(rr);
+        if (row_can(row, -1) || row_can(row, 1))
+            theme_arrows(ar, row_can(row, -1), row_can(row, 1), lit);
+    }
+
+    r.x = 62; r.y = 168 + count * 62 + 10;
+    r.w = g_cw - 124; r.h = 46;
+    if (g_sel < count) {
+        if (wrap_help)
+            theme_text_wrapped(r, row_help(&rows[g_sel]), 11, THEME_TEXT_DIM);
+        else
+            theme_text(r, row_help(&rows[g_sel]), 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    }
+    return r.y + r.h;
+}
+
+static ThemeRect g_link_panel;          /* where the addresses are: a click copies */
+
+static void draw_link(void)
+{
+    ThemeRect p, line;
+    char text[320], share[96];
+    int y = draw_rows(g_link_rows, g_link_count, 1) + 8;
+
+    p.x = 60; p.y = y; p.w = g_cw - 120;
+    p.h = (g_ch - 96) - y;
+    if (p.h > 230) p.h = 230;
+    g_link_panel = p;
+    theme_panel(p, 0.25);
+    line = p; line.x += 24; line.w -= 48; line.y += 16; line.h = 22;
+
+    if (g_link_mode == LINK_HOST) {
+        int asked = g_settings.syslink_upnp;
+
+        theme_text(line, "TELL YOUR FRIENDS", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30;
+        snprintf(text, sizeof text, "On your network      %s:%d", g_lan_addr, link_port());
+        theme_text(line, text, 12, 400, THEME_TEXT, THEME_LEFT);
+        line.y += 26;
+
+        if (!asked) {
+            snprintf(text, sizeof text, "On the internet      only with UDP port %d forwarded"
+                     " to this PC by hand, or over a virtual network", link_port());
+        } else if (lhost_read(&g_probe_state) != 2) {
+            snprintf(text, sizeof text, "On the internet      asking the router...");
+        } else if (g_probe.state == NET_UPNP_FOUND) {
+            snprintf(text, sizeof text, "On the internet      %s:%d   (the router is asked"
+                     " to open it when the game starts)", g_probe.external, link_port());
+        } else {
+            snprintf(text, sizeof text, "On the internet      %s", g_probe.detail);
+        }
+        line.h = 40;
+        theme_text_wrapped(line, text, 12,
+                           (asked && lhost_read(&g_probe_state) == 2 &&
+                            g_probe.state == NET_UPNP_FOUND)
+                               ? THEME_TEXT : THEME_TEXT_DIM);
+        line.y += 46;
+        line.h = 60;
+        link_share_address(share, sizeof share);
+        snprintf(text, sizeof text,
+                 "%s  " LAUNCHER_FIREWALL " may ask to let the game through its"
+                 " firewall the first time: allow it. Then host or join a game in"
+                 " the game's own System Link menu.",
+                 lhost_ticks() < g_copied_until ? "Copied."
+                                                : LAUNCHER_COPY_KEY " or a click here copies it.");
+        theme_text_wrapped(line, text, 11, THEME_TEXT_DIM);
+    } else if (g_link_mode == LINK_JOIN) {
+        theme_text(line, "JOINING", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 120;
+        theme_text_wrapped(line,
+            "Ask the host for their address, and the join code if they set one."
+            " Nothing needs opening on your router. Start the game and open its"
+            " System Link menu: games anyone in the session hosts appear there."
+            " If none does, the log beside the game says whether the host answered.",
+            12, THEME_TEXT_DIM);
+    } else {
+        theme_text(line, "SYSTEM LINK", 10, 700, THEME_GREEN, THEME_LEFT);
+        line.y += 30; line.h = 120;
+        theme_text_wrapped(line, g_link_mode == LINK_BY_HAND
+            ? "The settings file sets up a pair by hand (syslink = udp, with"
+              " syslink_remote). Choose Host or Join here to replace it."
+            : "Consoles linked together play in one game, as they did with a cable"
+              " or a network switch. One player hosts the session, up to 15 more"
+              " join it, from the same network or over the internet. Each needs"
+              " their own copy of the game.",
+            12, THEME_TEXT_DIM);
+    }
+}
+
+/* ------------------------------------------- a release's first-run screens */
+
+static int hit_play(int mx, int my);
+
+/* The path box and the three buttons under it. */
+static ThemeRect setup_rect(int i)
+{
+    ThemeRect r;
+
+    if (i == 0) {
+        r.x = 60; r.y = 270; r.w = g_cw - 120; r.h = 52;
+        return r;
+    }
+    r.w = (g_cw - 120 - 2 * 20) / 3;
+    r.h = 46;
+    r.y = 342;
+    r.x = 60 + (i - 1) * (r.w + 20);
+    return r;
+}
+
+static int in_rect(ThemeRect r, int mx, int my)
+{
+    return mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h;
+}
+
+static void release_start_build(void)
+{
+    char exe[LAUNCHER_PATH + 64];
+    const char *argv[5];
+
+    if (!g_source[0]) {
+        snprintf(g_rel_note, sizeof g_rel_note,
+                 "Choose the disc image or the game's folder first.");
+        return;
+    }
+#if defined(__APPLE__)
+    if (release_translocated_error())
+        return;
+#endif
+#ifdef _WIN32
+    snprintf(exe, sizeof exe, "%s\\bin\\xboxrecomp-build.exe", g_release_dir);
+#else
+    snprintf(exe, sizeof exe, "%s/bin/xboxrecomp-build", g_release_dir);
+#endif
+    g_rel_relinking = g_rel_moved;
+    argv[0] = exe; argv[1] = g_rel_relinking ? "relink" : "build";
+    argv[2] = "--source"; argv[3] = g_source;
+    argv[4] = NULL;
+    g_rel_error[0] = g_rel_note[0] = '\0';
+    g_rel_unsupported = g_build_cancelled = 0;
+    g_build_progress = 0.0;
+    snprintf(g_build_label, sizeof g_build_label, "Starting");
+    g_build_detail[0] = '\0';
+    g_build_started = lhost_ticks();
+    if (!lhost_job_start(argv)) {
+        snprintf(g_rel_error, sizeof g_rel_error,
+                 "The builder could not be started (%s).", exe);
+        return;
+    }
+    g_rel = REL_BUILDING;
+}
+
+/* One line of the builder's progress (tools/builder: one JSON object a line). */
+static void release_line(const char *line)
+{
+    char ev[24];
+
+    if (!json_str(line, "event", ev, sizeof ev))
+        return;
+    if (strcmp(ev, "progress") == 0) {
+        g_build_progress = json_num(line, "overall");
+        json_str(line, "label", g_build_label, sizeof g_build_label);
+        if (!json_str(line, "detail", g_build_detail, sizeof g_build_detail))
+            g_build_detail[0] = '\0';
+    } else if (strcmp(ev, "error") == 0) {
+        json_str(line, "message", g_rel_error, sizeof g_rel_error);
+        g_rel_unsupported = strstr(line, "\"unsupported\":true") != NULL;
+        /* Another copy of the game: relinking can't help, building can. */
+        if (strstr(line, "\"rebuild\":true"))
+            g_rel_moved = 0;
+    }
+}
+
+static void release_tick(void)
+{
+    char line[4096];
+    int n = 0, code;
+
+    while (n++ < 64 && lhost_job_line(line, sizeof line))
+        release_line(line);
+    code = lhost_job_status();
+    if (code < 0)
+        return;
+    if (code == 0 && !g_rel_error[0]) {
+        /* Built: the game's own files now name it, and the settings are
+         * its; then the ordinary launcher, Play and all. */
+        g_rel_stale = 0;
+        read_title();
+        settings_load();
+        build_rows();
+        rows_for_tab();
+        release_status();
+        if (g_rel != REL_READY) {
+            snprintf(g_rel_error, sizeof g_rel_error,
+                     "The build finished but the game is not where it should be (%s).",
+                     g_user_dir);
+            g_rel = REL_SETUP;
+            return;
+        }
+        /* Say so, rather than swapping screens under the player. */
+        g_build_ms = lhost_ticks() - g_build_started;
+        g_rel = REL_DONE;
+        return;
+    }
+    g_rel = REL_SETUP;
+    if (g_build_cancelled) {
+        snprintf(g_rel_note, sizeof g_rel_note, g_rel_relinking
+                 ? "Cancelled. Choose the game's files to try again."
+                 : "Cancelled. Build again to start over.");
+        g_rel_error[0] = '\0';
+    } else if (!g_rel_error[0]) {
+        snprintf(g_rel_error, sizeof g_rel_error,
+                 "The build stopped (exit %d). Its log is %s/build.log.", code, g_user_dir);
+    }
+}
+
+static void draw_setup(void)
+{
+    ThemeRect p, r;
+    int i;
+
+    p.x = 60; p.y = 104; p.w = g_cw - 120; p.h = 140;
+    theme_panel(p, 0.2);
+    r.x = p.x + 24; r.y = p.y + 18; r.w = p.w - 48; r.h = 26;
+    theme_text(r, g_rel_moved ? "The game's files have moved"
+                  : g_rel_stale ? "Build the game again" : "Your copy of the game",
+               15, 700, THEME_TEXT, THEME_LEFT);
+    r.y += 36; r.h = 80;
+    theme_text_wrapped(r, g_rel_moved
+        ? "The game is built, but the folder it was built from is no longer where "
+          "it was. Choose where it is now, or the disc image: the game is linked to "
+          "it again in a few seconds, with nothing rebuilt. Your saves stay."
+        : g_rel_stale
+        ? "This release is newer than the game it built for you. Build it again "
+          "from the same disc to bring it up to date; your saves and settings stay."
+        : "Choose your disc image (.iso) or the folder the game's files are in. "
+          "The game is built from it once, here on this computer, which takes a "
+          "minute or two. An image is extracted to your home folder; a folder is "
+          "linked, never copied or changed.", 12, THEME_TEXT_DIM);
+
+    r = setup_rect(0);
+    theme_panel(r, g_setup_sel == 0 ? 0.8 : 0.25);
+    r.x += 18; r.w -= 36;
+    if (g_source[0]) {
+        char shown[LAUNCHER_PATH + 4];
+
+        snprintf(shown, sizeof shown, "%s%s", g_source,
+                 g_setup_sel == 0 && ((int)(g_pulse * 4) & 1) ? "_" : "");
+        theme_text(r, shown, 12, 400, THEME_TEXT, THEME_LEFT);
+    } else {
+        theme_text(r, "Type or paste a path, or choose one below", 12, 400,
+                   THEME_TEXT_DIM, THEME_LEFT);
+    }
+    for (i = 1; i <= 3; i++) {
+        static const char *const k_labels[] = { "", "DISC IMAGE...", "FOLDER...", "BUILD" };
+        const char *label = (i == 3 && g_rel_moved) ? "LINK AGAIN"
+                          : (i == 3 && g_rel_stale) ? "BUILD AGAIN" : k_labels[i];
+
+        r = setup_rect(i);
+        theme_panel(r, g_setup_sel == i ? 0.9 : 0.3);
+        theme_text(r, label, 12, 700,
+                   (i == 3 && !g_source[0]) ? THEME_TEXT_DIM : THEME_TEXT, THEME_CENTRE);
+    }
+
+    r.x = 60; r.y = 416; r.w = g_cw - 120; r.h = 290;
+    if (g_rel_error[0]) {
+        theme_panel(r, 0.15);
+        r.x += 24; r.y += 16; r.w -= 48; r.h = 24;
+        theme_text(r, g_rel_unsupported ? "This disc can't be used"
+                      : g_rel_relinking ? "The game's files were not linked"
+                      : "The build did not finish",
+                   13, 700, THEME_GREEN, THEME_LEFT);
+        r.y += 30; r.h = 230;
+        theme_text_wrapped(r, g_rel_error, 11, THEME_TEXT);
+    } else if (g_rel_note[0]) {
+        r.h = 40;
+        theme_text_wrapped(r, g_rel_note, 12, THEME_TEXT_DIM);
+    }
+
+    r.x = 60; r.y = g_ch - 44; r.w = g_cw - 120; r.h = 24;
+    theme_text(r, g_pad_seen
+                  ? "A  Choose      B  Quit      D-pad  Move"
+                  : "Enter  Choose      Esc  Quit      Type or paste a path in the box",
+               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+}
+
+static void draw_building(void)
+{
+    ThemeRect p, r, b;
+    char pct[16];
+
+    p.x = 60; p.y = 130; p.w = g_cw - 120; p.h = 300;
+    theme_panel(p, 0.3);
+    r.x = p.x + 30; r.y = p.y + 26; r.w = p.w - 60; r.h = 28;
+    theme_text(r, g_rel_relinking ? "Finding the game's files" : "Building the game",
+               16, 700, THEME_TEXT, THEME_LEFT);
+    r.y += 50; r.h = 24;
+    theme_text(r, g_build_label, 13, 700, THEME_GREEN, THEME_LEFT);
+    snprintf(pct, sizeof pct, "%d%%", (int)(g_build_progress * 100.0 + 0.5));
+    theme_text(r, pct, 13, 700, THEME_TEXT, THEME_RIGHT);
+    b.x = r.x; b.y = r.y + 40; b.w = r.w; b.h = 16;
+    theme_bar(b, g_build_progress, g_pulse * 2.0);   /* a sweep every ~1.4 s */
+    r.y = b.y + 34; r.h = 22;
+    theme_text(r, g_build_detail, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+    r.y += 44; r.h = 70;
+    theme_text_wrapped(r, g_rel_relinking
+                          ? "Linking the game to its files again. Nothing is rebuilt."
+                          : "This happens once. Later starts go straight to the game. "
+                            "It is building from your own copy, on this computer.",
+                       11, THEME_TEXT_DIM);
+
+    r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
+    theme_text(r, g_pad_seen ? "B  Cancel" : "Esc  Cancel", 11, 400,
+               THEME_TEXT_DIM, THEME_LEFT);
+    b.w = 150; b.h = 42; b.x = g_cw - 60 - b.w; b.y = g_ch - 74;
+    theme_panel(b, 0.5);
+    theme_text(b, "CANCEL", 13, 700, THEME_TEXT, THEME_CENTRE);
+}
+
+static void draw_done(void)
+{
+    ThemeRect p, r, b;
+    char text[LAUNCHER_PATH + 400];
+    unsigned secs = (unsigned)((g_build_ms + 500) / 1000);
+
+    if (g_rel_relinking)
+        snprintf(text, sizeof text, "%s is linked to its files at %s again. Nothing was "
+                 "rebuilt, and your saves are where they were.", g_title_name, g_source);
+    else if (secs >= 60)
+        snprintf(text, sizeof text, "%s was built from your copy in %u min %u s. "
+                 "Next time, the launcher opens straight to the settings and Play.",
+                 g_title_name, secs / 60, secs % 60);
+    else
+        snprintf(text, sizeof text, "%s was built from your copy in %u s. "
+                 "Next time, the launcher opens straight to the settings and Play.",
+                 g_title_name, secs);
+
+    p.x = 60; p.y = 130; p.w = g_cw - 120; p.h = 300;
+    theme_panel(p, 0.3);
+    r.x = p.x + 30; r.y = p.y + 26; r.w = p.w - 60; r.h = 28;
+    theme_text(r, "The game is ready", 16, 700, THEME_GREEN, THEME_LEFT);
+    r.y += 50; r.h = 24;
+    theme_text(r, g_rel_relinking ? "Files found" : "Build complete",
+               13, 700, THEME_TEXT, THEME_LEFT);
+    theme_text(r, "100%", 13, 700, THEME_TEXT, THEME_RIGHT);
+    b.x = r.x; b.y = r.y + 40; b.w = r.w; b.h = 16;
+    theme_bar(b, 1.0, -1.0);
+    r.y = b.y + 34; r.h = 90;
+    theme_text_wrapped(r, text, 12, THEME_TEXT);
+
+    r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
+    theme_text(r, g_pad_seen ? "A  OK" : "Enter  OK", 11, 400,
+               THEME_TEXT_DIM, THEME_LEFT);
+    b.w = 150; b.h = 42; b.x = g_cw - 60 - b.w; b.y = g_ch - 74;
+    theme_panel(b, 0.9);
+    theme_text(b, "OK", 13, 700, THEME_TEXT, THEME_CENTRE);
+}
+
+/* OK: on to the ordinary launcher, Play and all. */
+static void done_ok(void)
+{
+    g_rel = REL_READY;
+}
+
+static void setup_activate(int i)
+{
+    if (i == 1 || i == 2) {
+        if (!lhost_pick(i == 2))
+            snprintf(g_rel_note, sizeof g_rel_note,
+                     "No file dialog here: type or paste the path in the box.");
+    } else {
+        release_start_build();
+    }
+}
+
+static void setup_nav(int dx, int dy, int accept, int cancel)
+{
+    if (g_rel == REL_DONE) {
+        if (accept || cancel)
+            done_ok();
+        return;
+    }
+    if (g_rel == REL_BUILDING) {
+        if (cancel && !g_build_cancelled) {
+            g_build_cancelled = 1;
+            lhost_job_cancel();
+        }
+        return;
+    }
+    if (dy < 0) g_setup_sel = 0;
+    if (dy > 0 && g_setup_sel == 0) g_setup_sel = 1;
+    if (dx && g_setup_sel > 0) {
+        g_setup_sel += dx;
+        if (g_setup_sel < 1) g_setup_sel = 1;
+        if (g_setup_sel > 3) g_setup_sel = 3;
+    }
+    if (accept)
+        setup_activate(g_setup_sel);
+    if (cancel)
+        lhost_close();
+}
+
+static void setup_click(int mx, int my)
+{
+    int i;
+
+    if (g_rel == REL_DONE) {
+        if (hit_play(mx, my))
+            done_ok();
+        return;
+    }
+    if (g_rel == REL_BUILDING) {
+        if (hit_play(mx, my) && !g_build_cancelled) {
+            g_build_cancelled = 1;
+            lhost_job_cancel();
+        }
+        return;
+    }
+    for (i = 0; i <= 3; i++)
+        if (in_rect(setup_rect(i), mx, my)) {
+            g_setup_sel = i;
+            if (i)
+                setup_activate(i);
+        }
+}
+
+static void setup_char(unsigned ch)
+{
+    size_t n = strlen(g_source);
+
+    if (g_rel != REL_SETUP)
+        return;
+    if (ch == 22) {
+        char paste[LAUNCHER_PATH];
+
+        if (lhost_paste(paste, sizeof paste))
+            snprintf(g_source, sizeof g_source, "%s", paste);
+    } else if (ch == 8) {
+        if (n) g_source[n - 1] = '\0';
+    } else if (ch >= 32 && ch < 127 && n + 1 < sizeof g_source) {
+        g_source[n] = (char)ch;
+        g_source[n + 1] = '\0';
+    } else {
+        return;
+    }
+    g_setup_sel = 0;
+    g_rel_note[0] = '\0';
+}
+
+void launcher_picked(const char *path)
+{
+    if (!path) {
+        snprintf(g_rel_note, sizeof g_rel_note,
+                 "Nothing chosen. If no dialog appeared, type or paste the path in the box.");
+        return;
+    }
+    snprintf(g_source, sizeof g_source, "%s", path);
+    release_start_build();
+}
+
+/* ------------------------------------------------------------------ home
+ *
+ * A title that brands its launcher (recomp_add_launcher(... BRAND_...))
+ * gets a front page in front of the tabs: its picture, its logo, Play, and
+ * cards saying whether the game is ready and what is new. Settings and
+ * Controls open the tabs, and Escape there comes back here. */
+
+#ifdef LAUNCHER_HAS_BRAND
+extern const unsigned char launcher_brand_background[];
+extern const unsigned      launcher_brand_background_size;
+extern const unsigned char launcher_brand_logo[];
+extern const unsigned      launcher_brand_logo_size;
+extern const unsigned      launcher_brand_accent, launcher_brand_motes;   /* 0xRRGGBB */
+extern const char          launcher_brand_title[], launcher_brand_footer[];
+extern const char          launcher_brand_news_title[], launcher_brand_news_text[];
+#endif
+
+/* g_home is declared above nav(): the front page is up */
+static int g_home_sel;          /* 0 Play, 1 Settings, 2 Controls */
+#define HOME_ITEMS 3
+
+static int home_left(void) { return g_cw * 46 / 100; }
+
+static ThemeRect home_rect(int i)
+{
+    ThemeRect r;
+    int w = home_left() - 96;
+
+    r.x = 48; r.w = w; r.h = 68;
+    r.y = g_ch - 236;
+    if (i == 0)
+        return r;
+    r.y += 84; r.h = 46;
+    r.w = (w - 12) / 2;
+    if (i == 2)
+        r.x += r.w + 12;
+    return r;
+}
+
+static int home_hit(int mx, int my)
+{
+    int i;
+
+    for (i = 0; i < HOME_ITEMS; i++) {
+        ThemeRect r = home_rect(i);
+
+        if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
+            return i;
+    }
+    return -1;
+}
+
+static void home_activate(int i)
+{
+    if (i == 0) {
+        do_play();
+        return;
+    }
+    g_home = 0;
+    set_tab(i == 1 ? TAB_VIDEO : TAB_INPUT);
+}
+
+static int game_ready(void)
+{
+    return g_release ? g_rel == REL_READY : g_xbe_found[0] != '\0';
+}
+
+static void draw_home(void)
+{
+    ThemeRect r, c;
+    char line[256];
+    int i, left = home_left(), x, w;
+    const char *cap;
+    const char *news_title = "", *news_text = "", *footer = "";
+
+#ifdef LAUNCHER_HAS_BRAND
+    news_title = launcher_brand_news_title;
+    news_text = launcher_brand_news_text;
+    footer = launcher_brand_footer;
+#endif
+
+    r.x = 36; r.y = 30; r.w = left - 72; r.h = g_ch - 236 - 30 - 24;
+    theme_logo(r);
+
+    for (i = 0; i < HOME_ITEMS; i++)
+        theme_button(home_rect(i), i == 0 ? "PLAY" : i == 1 ? "Settings" : "Controls",
+                     i == 0, i == g_home_sel ? 1.0 : 0.0);
+
+    r.x = 48; r.y = g_ch - 42; r.w = left - 60; r.h = 20;
+    theme_text(r, footer, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+    /* The corner: the toolkit and the release, small. */
+    r.x = left; r.y = 12; r.w = g_cw - left - 36; r.h = 18;
+    if (g_release && g_release_version[0])
+        snprintf(line, sizeof line, "DirectXbox-Recomp   |   %s", g_release_version);
+    else
+        snprintf(line, sizeof line, "DirectXbox-Recomp");
+    theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_RIGHT);
+
+    x = left + 12;
+    w = g_cw - x - 36;
+
+    /* The game: ready or not, and how it is set to run. */
+    r.x = x; r.y = 56; r.w = w; r.h = 158;
+    c = theme_card(r, "GAME");
+    theme_dot(c.x + 6, c.y + 11, 5, game_ready() ? RGB(0x5C, 0xE0, 0x7A) : RGB(0xE0, 0xA0, 0x40));
+    r = c; r.x += 20; r.w -= 20; r.h = 22;
+    theme_text(r, game_ready() ? "Ready to play" : "Your game files are not set up yet",
+               13, 700, THEME_TEXT, THEME_LEFT);
+    r = c; r.y += 30; r.h = 18;
+    snprintf(line, sizeof line, "%s   |   title %08X", g_title_name, g_title_id);
+    theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
+    cap = g_settings.frame_cap;
+    r.y += 22;
+    snprintf(line, sizeof line, "%dx resolution   |   %s   |   %s%s",
+             g_settings.resolution_scale, g_widescreen ? "widescreen" : "4:3",
+             strcmp(cap, "adaptive") == 0 ? "60 fps" : strcmp(cap, "0") == 0 ? "uncapped" : cap,
+             (strcmp(cap, "adaptive") == 0 || strcmp(cap, "0") == 0) ? "" : " fps");
+    theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
+    r.y += 22;
+    theme_text(r, g_settings.fullscreen ? "Fullscreen" : "In a window", 10, 400,
+               THEME_TEXT_DIM, THEME_LEFT);
+
+    /* What the title has to say. */
+    if (news_title[0] || news_text[0]) {
+        r.x = x; r.y = 234; r.w = w; r.h = 196;
+        c = theme_card(r, "NEWS");
+        r = c; r.h = 24;
+        theme_text(r, news_title, 14, 700, THEME_TEXT, THEME_LEFT);
+        r = c; r.y += 32; r.h = c.h - 32;
+        theme_text_wrapped(r, news_text, 11, THEME_TEXT_DIM);
+    }
+
+    /* How to drive it, for the pad or the keyboard in front of it. */
+    r.x = x; r.y = 450; r.w = w; r.h = 112;
+    c = theme_card(r, "CONTROLS");
+    theme_text_wrapped(c, g_pad_seen
+        ? "A plays, B quits. The D-pad moves between the buttons. Controls opens "
+          "the bindings for every controller and the keyboard."
+        : "Enter plays, Esc quits, the arrows move between the buttons. A "
+          "controller works here too.",
+        11, THEME_TEXT_DIM);
+}
+
+static void home_nav(int dx, int dy, int accept, int cancel)
+{
+    if (dy > 0 && g_home_sel == 0)
+        g_home_sel = 1;
+    else if (dy < 0 && g_home_sel != 0)
+        g_home_sel = 0;
+    else if (dx && g_home_sel != 0)
+        g_home_sel = g_home_sel == 1 ? 2 : 1;
+    if (accept)
+        home_activate(g_home_sel);
+    else if (cancel)
+        lhost_close();
+}
+
+/* Escape on the tabs: back to the front page when there is one. */
+static void back_or_quit(void)
+{
+    if (theme_branded())
+        g_home = 1;
+    else
+        lhost_close();
+}
+
+static void draw(void)
+{
+    ThemeRect r;
+    int i;
+
+    theme_background(g_pulse);
+
+    if (g_home && !(g_release && g_rel != REL_READY)) {
+        draw_home();
+        return;
+    }
+
+    /* Title. The game's own name, from its certificate. */
+    r.x = 60; r.y = 30; r.w = g_cw - 120; r.h = 46;
+    theme_text(r, g_title_name, 26, 700, THEME_TEXT, THEME_LEFT);
+
+    /* A release without its game yet: the disc, or the build. */
+    if (g_release && g_rel != REL_READY) {
+        if (g_rel == REL_BUILDING)
+            draw_building();
+        else if (g_rel == REL_DONE)
+            draw_done();
+        else
+            draw_setup();
+        return;
+    }
+
+    for (i = 0; i < TAB_COUNT; i++) {
+        ThemeRect t = tab_rect(i);
+
+        theme_text(t, k_tab_names[i], 12, 700,
+                   i == g_tab ? THEME_GREEN : THEME_TEXT_DIM, THEME_CENTRE);
+    }
+    {
+        ThemeRect a = tab_rect(g_tab_from), b = tab_rect(g_tab);
+
+        a.y += 34; b.y += 34;
+        theme_tab_underline(a, b, g_tab_t);
+    }
+
+    if (g_tab == TAB_VIDEO) {
+        draw_rows(g_video_rows, g_video_count, 0);
+    } else if (g_tab == TAB_LINK) {
+        draw_link();
+    } else if (g_tab == TAB_INPUT) {
+        BindPort *bp = &g_bind.port[g_bind_port];
+        char line[160];
+        int i;
+
+        /* Column headings, so the two sides are not a guess. */
+        {
+            ThemeRect h2 = row_rect(0);
+
+            h2.y -= 24; h2.h = 20;
+            h2.x += 300; h2.w = 200;
+            theme_text(h2, "CONTROLLER", 10, 700,
+                       g_bind_col == 0 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            h2.x += 210;
+            theme_text(h2, "KEYBOARD / MOUSE", 10, 700,
+                       g_bind_col == 1 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+        }
+
+        for (i = 0; i < BIND_ROWS_VISIBLE; i++) {
+            int k = g_bind_top + i;
+            ThemeRect rr, lr, cv;
+            double lit;
+            const char *label = NULL;
+
+            if (k >= BIND_TOTAL_ROWS)
+                break;
+            rr = row_rect(i);
+            rr.h = 46;
+            lit = (i == g_sel) ? 1.0 : 0.0;
+            theme_panel(rr, lit);
+
+            lr = rr; lr.x += 22; lr.w = 270;
+            cv = rr; cv.x += 300; cv.w = 400;
+
+            if (k == BIND_ROW_PORT) {
+                snprintf(line, sizeof line, "Controller %d", g_bind_port + 1);
+                theme_text(lr, "Editing", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_DEVICE) {
+                if (bp->device == BIND_DEV_PAD) {
+                    char name[64];
+
+                    recomp_pad_name(bp->pad, name, sizeof name);
+                    if (name[0])
+                        snprintf(line, sizeof line, "Gamepad %d  (%s)", bp->pad + 1, name);
+                    else
+                        snprintf(line, sizeof line, "Gamepad %d  (not plugged in)", bp->pad + 1);
+                } else if (bp->device == BIND_DEV_KEYBOARD) {
+                    snprintf(line, sizeof line, "Keyboard");
+                } else {
+                    snprintf(line, sizeof line, "Nothing");
+                }
+                theme_text(lr, "Read from", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_API) {
+                theme_text(lr, "Controllers", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, g_bind.pad_api == BIND_PAD_API_XINPUT
+                                   ? "Xbox controllers only (XInput)"
+                                   : "All controllers (SDL3)",
+                           12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_MOUSE) {
+                theme_text(lr, "Mouse look", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, g_settings.mouse_look
+                                   ? "On  (the mouse moves controller 1's right stick)"
+                                   : "Off",
+                           12, 400, lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_SENS) {
+                snprintf(line, sizeof line, "%d%s", g_settings.mouse_sensitivity,
+                         g_settings.mouse_sensitivity == RECOMP_MOUSE_SENSITIVITY_DEFAULT
+                             ? "  (default)" : "");
+                theme_text(lr, "Mouse sensitivity", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, line, 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else if (k == BIND_ROW_RESET) {
+                theme_text(lr, "Reset this controller", 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+                theme_text(cv, "Back to the defaults", 12, 400,
+                           lit > 0.5 ? THEME_GREEN : THEME_TEXT_DIM, THEME_LEFT);
+            } else {
+                int c = k - BIND_HEAD_ROWS;
+
+                label = bind_control_labels[c];
+                theme_text(lr, label, 12, 600,
+                           lit > 0.5 ? THEME_TEXT : THEME_TEXT_DIM, THEME_LEFT);
+
+                cv.w = 200;
+                theme_text(cv,
+                           (g_capturing && lit > 0.5 && g_bind_col == 0)
+                               ? "press something..." : bind_source_label(bp->pad_src[c]),
+                           12, 400,
+                           (lit > 0.5 && g_bind_col == 0) ? THEME_GREEN : THEME_TEXT_DIM,
+                           THEME_LEFT);
+                cv.x += 210;
+                theme_text(cv,
+                           (g_capturing && lit > 0.5 && g_bind_col == 1)
+                               ? "press a key or click..." : bind_source_label(bp->key_src[c]),
+                           12, 400,
+                           (lit > 0.5 && g_bind_col == 1) ? THEME_GREEN : THEME_TEXT_DIM,
+                           THEME_LEFT);
+            }
+
+            if (lit > 0.5 && k == BIND_ROW_SENS)
+                theme_arrows(arrows_rect(rr),
+                             g_settings.mouse_sensitivity > RECOMP_MOUSE_SENSITIVITY_MIN,
+                             g_settings.mouse_sensitivity < RECOMP_MOUSE_SENSITIVITY_MAX, lit);
+            else if (lit > 0.5 && k < BIND_ROW_RESET)
+                theme_arrows(arrows_rect(rr), 1, 1, lit);
+        }
+
+        /* Where we are in a list longer than the screen. */
+        {
+            ThemeRect sb;
+
+            sb.x = g_cw - 48;
+            sb.w = 4;
+            sb.h = (BIND_ROWS_VISIBLE * 62) * BIND_ROWS_VISIBLE / BIND_TOTAL_ROWS;
+            sb.y = row_rect(0).y +
+                   (BIND_ROWS_VISIBLE * 62 - sb.h) * g_bind_top /
+                   (BIND_TOTAL_ROWS - BIND_ROWS_VISIBLE);
+            theme_panel(sb, 0.5);
+        }
+
+        r.x = 62; r.y = row_rect(0).y + BIND_ROWS_VISIBLE * 62 + 2;
+        r.w = g_cw - 124; r.h = 40;
+        {
+            int k = g_bind_top + g_sel;
+
+            theme_text_wrapped(r,
+                g_capturing ? (g_bind_col == 1
+                                   ? "Press a key, or click any mouse button. Escape cancels."
+                                   : "Press what you want this to be. Escape cancels.")
+                : k == BIND_ROW_PORT   ? "Which of the four controllers these bindings are for."
+                : k == BIND_ROW_DEVICE ? "What this controller reads: a gamepad, the keyboard, or nothing."
+                : k == BIND_ROW_API    ? "All controllers reads Xbox, PlayStation, Switch and most other pads. "
+                                         "Xbox controllers only is the older XInput path, for a pad that misbehaves. "
+                                         "Every game uses this."
+                : k == BIND_ROW_MOUSE  ? "Moving the mouse turns controller 1's right stick, and the stick "
+                                         "itself still works. Click in the game to give it the pointer; "
+                                         "switching away gives it back. This game only."
+                : k == BIND_ROW_SENS   ? "How far a movement of the mouse pushes the stick: higher turns faster. "
+                                         "A or Enter goes back to the default. This game only."
+                : k == BIND_ROW_RESET  ? "Put this controller back to the built-in mapping."
+                : "Left and right choose the controller or the keyboard and mouse column. "
+                  "A or Enter rebinds. Bindings are shared by every game.",
+                11, THEME_TEXT_DIM);
+        }
+    } else {
+        ThemeRect p = row_rect(0);
+        char line[1024];
+
+        p.h = 190;
+        theme_panel(p, 0.25);
+        p.x += 24; p.y += 18; p.w -= 48; p.h = 26;
+        theme_text(p, g_title_name, 15, 700, THEME_TEXT, THEME_LEFT);
+
+        p.y += 32;
+        snprintf(line, sizeof line, "Title id  %08X", g_title_id);
+        theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+        p.y += 24;
+        {
+            char path[1024];
+            if (recomp_settings_path(g_title_id, path, sizeof path))
+                snprintf(line, sizeof line, "Settings  %s", path);
+            else
+                snprintf(line, sizeof line, "Settings  (nowhere to write)");
+        }
+        theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+        p.y += 24;
+        if (g_release)
+            snprintf(line, sizeof line, "Game      %s/%s (built from %s)",
+                     g_user_dir, g_release_exe, g_source[0] ? g_source : "your disc");
+        else
+            snprintf(line, sizeof line, "Game      %s", LAUNCHER_GAME_EXE);
+        theme_text(p, line, 11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+        /* Where the title id came from, or that it did not: without it the
+         * settings above go to default.conf, which the game does not read. */
+        p.y += 24;
+        if (g_xbe_found[0])
+            snprintf(line, sizeof line, "Files     %s", g_xbe_found);
+        else
+            snprintf(line, sizeof line, "Files     not found -- settings will not reach the game");
+        theme_text(p, line, 11, 400, g_xbe_found[0] ? THEME_TEXT_DIM : THEME_TEXT,
+                   THEME_LEFT);
+
+        p.y += 34; p.h = 60;
+        theme_text_wrapped(p,
+            "A native build of an Xbox game, not an emulator. Settings "
+            "chosen here are written to a file the game reads when it starts.",
+            11, THEME_TEXT_DIM);
+    }
+
+    /* The footer says how to drive it, and changes with what is plugged in. */
+    r.x = 60; r.y = g_ch - 44; r.w = g_cw - 260; r.h = 24;
+    theme_text(r, g_pad_seen
+                  ? (theme_branded()
+                        ? "A  Play      B  Back      LB RB  Change tab      D-pad  Move"
+                        : "A  Play      B  Quit      LB RB  Change tab      D-pad  Move")
+                  : theme_branded()
+                        ? "Enter  Play      Esc  Back      Tab  Change tab      Arrows  Move"
+                        : "Enter  Play      Esc  Quit      Tab  Change tab      Arrows  Move",
+               11, 400, THEME_TEXT_DIM, THEME_LEFT);
+
+    {   /* Play, always on screen, always the obvious thing to press. */
+        ThemeRect b;
+
+        b.w = 150; b.h = 42;
+        b.x = g_cw - 60 - b.w;
+        b.y = g_ch - 74;
+        if (theme_branded()) {
+            theme_button(b, "PLAY", 1, 0.0);
+        } else {
+            theme_panel(b, 0.85);
+            theme_text(b, "PLAY", 13, 700, THEME_TEXT, THEME_CENTRE);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- window */
+
+static int hit_row(int mx, int my)
+{
+    int i, count;
+
+    if (!tab_rows(&count))
+        return -1;
+    for (i = 0; i < count; i++) {
+        ThemeRect r = row_rect(i);
+
+        if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
+            return i;
+    }
+    return -1;
+}
+
+/* The Input tab's visible row under the mouse, or -1. Its rows are shorter
+ * than the Video tab's (46, not 52) and the list scrolls. */
+static int hit_bind_row(int mx, int my)
+{
+    int j;
+
+    if (g_tab != TAB_INPUT)
+        return -1;
+    for (j = 0; j < BIND_ROWS_VISIBLE && g_bind_top + j < BIND_TOTAL_ROWS; j++) {
+        ThemeRect r = row_rect(j);
+
+        r.h = 46;
+        if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
+            return j;
+    }
+    return -1;
+}
+
+static int hit_play(int mx, int my)
+{
+    return mx >= g_cw - 60 - 150 && mx < g_cw - 60 &&
+           my >= g_ch - 74 && my < g_ch - 32;
+}
+
+/* ---------------------------------------------------- the front end's calls */
+
+void launcher_init(void)
+{
+    const char *build;
+
+    release_init();
+    read_title();
+#ifdef LAUNCHER_HAS_BRAND
+    {
+        unsigned a = launcher_brand_accent, m = launcher_brand_motes;
+
+        if (theme_brand_load(launcher_brand_background, launcher_brand_background_size,
+                             launcher_brand_logo, launcher_brand_logo_size,
+                             RGB((a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF),
+                             RGB((m >> 16) & 0xFF, (m >> 8) & 0xFF, m & 0xFF)))
+            g_home = 1;
+    }
+#endif
+    settings_load();
+    bindings_load();
+    build_rows();
+    rows_for_tab();
+    /* RECOMP_LAUNCHER_BUILD=<image or folder>: build from it straight away,
+     * for a front end that already knows where the disc is, and for a
+     * script checking the whole path. */
+    build = getenv("RECOMP_LAUNCHER_BUILD");
+    if (g_release && build && *build && g_rel == REL_SETUP) {
+        snprintf(g_source, sizeof g_source, "%s", build);
+        release_start_build();
+    }
+}
+
+/* The window's title: the toolkit's name, then the game's, without its
+ * colons ("Turok: Evolution" reads as "Turok Evolution" after the dash). */
+#define LAUNCHER_BRAND "DirectXboxRecomp"
+
+const char *launcher_title(void)
+{
+    static char title[sizeof g_title_name + 32];
+    size_t n;
+    const char *c;
+
+#ifdef LAUNCHER_HAS_BRAND
+    if (launcher_brand_title[0])
+        return launcher_brand_title;
+#endif
+    n = (size_t)snprintf(title, sizeof title, LAUNCHER_BRAND " - ");
+
+    for (c = g_title_name; *c && n + 1 < sizeof title; c++)
+        if (*c != ':')
+            title[n++] = *c;
+    title[n] = '\0';
+    return title;
+}
+
+int launcher_mouse_button(int button)
+{
+    return capture_mouse(button);
+}
+
+void launcher_draw(void)
+{
+    draw();
+}
+
+void launcher_key(int key, int shift)
+{
+    switch (key) {
+    case LKEY_UP:     nav(0, -1, 0, 0, 0); break;
+    case LKEY_DOWN:   nav(0,  1, 0, 0, 0); break;
+    case LKEY_LEFT:   nav(-1, 0, 0, 0, 0); break;
+    case LKEY_RIGHT:  nav(1,  0, 0, 0, 0); break;
+    case LKEY_RETURN: nav(0, 0, 1, 0, 0); break;
+    case LKEY_ESCAPE: nav(0, 0, 0, 1, 0); break;
+    case LKEY_TAB:    nav(0, 0, 0, 0, shift ? -1 : 1); break;
+    default: break;
+    }
+}
+
+void launcher_char(unsigned ch)
+{
+    if (g_release && g_rel != REL_READY) {
+        setup_char(ch);
+        return;
+    }
+    /* Typing goes to the System Link tab's text rows; copy there copies
+     * the address a host gives out, paste pastes into a row. */
+    if (g_tab == TAB_LINK && g_sel < g_link_count && !g_capturing) {
+        Row *row = &g_link_rows[g_sel];
+
+        if (ch == 3 && g_link_mode == LINK_HOST) {
+            char share[96];
+
+            link_share_address(share, sizeof share);
+            copy_text(share);
+        } else if (ch == 22) {
+            row_paste(row);
+        } else {
+            row_type(row, ch);
+        }
+    }
+}
+
+void launcher_click(int mx, int my)
+{
+    int i;
+
+    if (g_release && g_rel != REL_READY) {
+        setup_click(mx, my);
+        return;
+    }
+    if (g_home) {
+        i = home_hit(mx, my);
+        if (i >= 0) {
+            g_home_sel = i;
+            home_activate(i);
+        }
+        return;
+    }
+    for (i = 0; i < TAB_COUNT; i++) {
+        ThemeRect t = tab_rect(i);
+
+        if (mx >= t.x && mx < t.x + t.w && my >= t.y && my < t.y + t.h)
+            set_tab((Tab)i);
+    }
+    if (g_tab == TAB_INPUT) {
+        int j;
+
+        for (j = 0; j < BIND_ROWS_VISIBLE; j++) {
+            ThemeRect rr = row_rect(j);
+
+            rr.h = 46;
+            if (my >= rr.y && my < rr.y + rr.h && mx >= rr.x &&
+                mx < rr.x + rr.w && g_bind_top + j < BIND_TOTAL_ROWS) {
+                int k = g_bind_top + j;
+
+                g_sel = j;
+                if (k < BIND_HEAD_ROWS) {
+                    /* The head rows change on a click: back or forward
+                     * on the arrows, forward anywhere else on the row.
+                     * (Splitting the whole row in half put both drawn
+                     * arrows in the forward half.) */
+                    int dir = hit_arrow(rr, mx);
+
+                    nav(dir ? dir : 1, 0, k == BIND_ROW_RESET, 0, 0);
+                } else {
+                    g_bind_col = (mx >= rr.x + 510) ? 1 : 0;
+                    g_capturing = 1;
+                    g_capture_armed = 0;
+                }
+            }
+        }
+        if (hit_play(mx, my))
+            do_play();
+        return;
+    }
+    i = hit_row(mx, my);
+    if (i >= 0) {
+        int dir = hit_arrow(row_rect(i), mx), count;
+        Row *rows = tab_rows(&count);
+
+        g_sel = i;
+        /* Back or forward on the arrows; anywhere else on the row steps
+         * it forward, which is how a toggle is clicked. A text row only
+         * takes the selection, to be typed into. */
+        row_move(&rows[i], dir ? dir : 1);
+        if (g_tab == TAB_LINK)
+            link_rows_changed();
+    } else if (g_tab == TAB_LINK && g_link_mode == LINK_HOST &&
+               mx >= g_link_panel.x && mx < g_link_panel.x + g_link_panel.w &&
+               my >= g_link_panel.y && my < g_link_panel.y + g_link_panel.h) {
+        char share[96];
+
+        link_share_address(share, sizeof share);
+        copy_text(share);
+    }
+    if (hit_play(mx, my))
+        do_play();
+}
+
+void launcher_hover(int mx, int my)
+{
+    int i;
+
+    if (g_home) {
+        i = home_hit(mx, my);
+        if (i >= 0)
+            g_home_sel = i;
+        return;
+    }
+    i = hit_row(mx, my);
+
+    /* The highlight follows the mouse on both lists -- but not away from
+     * a row waiting for the key to bind to it. */
+    if (i < 0 && !g_capturing)
+        i = hit_bind_row(mx, my);
+    if (i >= 0 && i != g_sel)
+        g_sel = i;
+}
+
+/* The wheel scrolls the one list that is longer than the window, the Input
+ * tab's, a row a notch. The selection stays on its row while that row is
+ * still in view, and the row under the pointer is then lit as a move would
+ * light it. The other tabs fit, so the wheel has nothing to do there. */
+void launcher_wheel(int rows, int mx, int my)
+{
+    int last = BIND_TOTAL_ROWS - BIND_ROWS_VISIBLE, top, k;
+
+    if (!rows || g_tab != TAB_INPUT || g_capturing)
+        return;
+    if (last < 0)
+        last = 0;
+    k = g_bind_top + g_sel;
+    top = g_bind_top + rows;
+    if (top < 0) top = 0;
+    if (top > last) top = last;
+    if (k < top) k = top;
+    if (k >= top + BIND_ROWS_VISIBLE) k = top + BIND_ROWS_VISIBLE - 1;
+    g_bind_top = top;
+    g_sel = k - top;
+    launcher_hover(mx, my);
+}
+
+void launcher_tick(void)
+{
+    int dx, dy, a, b, t;
+
+    g_pulse += 0.006;
+    if (g_pulse > 1.0) g_pulse -= 1.0;
+    if (g_tab_t < 1.0) {
+        g_tab_t += 0.12;
+        if (g_tab_t > 1.0) g_tab_t = 1.0;
+    }
+    if (g_tab == TAB_LINK)
+        link_tab_tick();
+    if (g_rel == REL_BUILDING)
+        release_tick();
+    g_pad_seen = pad_poll(&dx, &dy, &a, &b, &t);
+    if (g_capturing)
+        capture_tick();             /* the press is the answer, not a move */
+    else if (g_pad_seen && (dx || dy || a || b || t))
+        nav(dx, dy, a, b, t);
+    rows_for_tab();
+}
+
+void launcher_resize(int w, int h)
+{
+    g_cw = w;
+    g_ch = h;
+    if (g_cw > 0 && g_ch > 0)
+        theme_begin(g_cw, g_ch);
+}

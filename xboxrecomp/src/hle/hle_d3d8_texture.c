@@ -1,0 +1,2270 @@
+/*
+ * hle_d3d8_texture.c -- D3DDevice_SetTexture, forwarded to the shadow device.
+ *
+ * Part of shadow mode (hle_d3d8.c, RECOMP_HLE_D3D8=shadow). The title's own
+ * SetTexture runs first; then the texture it bound is found or built on the
+ * host device and bound to the same stage there.
+ *
+ * An Xbox texture is a guest X_D3DPixelContainer (Cxbx-Reloaded,
+ * XbD3D8Types.h): Common, Data, Lock, Format, Size. Data is a physical
+ * address; the runtime keeps physical page P at guest 0x80000000 + P, where
+ * MmAllocateContiguousMemory allocations live (xbox_memory_layout.c), so the
+ * texels are read there. Format packs the D3DFORMAT (bits 8-15), mip levels
+ * (16-19) and, for swizzled and compressed textures, log2 width and height
+ * (20-23, 24-27). A linear texture instead has a non-zero Size: width-1,
+ * height-1 and pitch/64-1, and one level (CxbxGetPixelContainerMeasures in
+ * XbConvert.cpp).
+ *
+ * The host D3D8 layer takes Xbox format codes itself and keeps a mip chain in
+ * the Xbox's own packing -- level after level, each row_pitch * rows -- which
+ * it unswizzles and converts at upload. So swizzled and compressed levels are
+ * copied as they are. That the guest packs its levels with no padding between
+ * them is assumed, not verified.
+ *
+ * Titles write texels without any call the replacement could see (Lock is
+ * inline), so a cached texture is checksummed again the first time it is
+ * bound in each frame and uploaded again if it changed.
+ *
+ * P8 is forwarded: the host expands palettised texels to BGRA at upload
+ * through the palette of the stage the texture is bound to, and
+ * D3DDevice_SetPalette at the end of this file supplies that palette from the
+ * guest's own resource. Because the expansion is baked, the palette a host
+ * texture was baked with is remembered, and it is baked again when it is
+ * drawn under a different one (sync_palette).
+ *
+ * Not handled, counted instead: cube and volume textures, surfaces bound as
+ * textures, textures outside the contiguous window, and any format
+ * d3d8_format_bpp does not know (named in the log when one is refused).
+ */
+#include "platform/xbox_winnt.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "hle.h"
+
+#include "d3d8_xbox.h"
+#include "d3d8_internal.h"
+#include "hle_d3d8_record.h"
+
+/* Reads a RECOMP_* switch; see xbox_memory_layout.h. Declared here rather than
+ * including the kernel header, which this file otherwise has no need of. */
+int xbox_EnvSwitch(const char *name, int default_on);
+
+/* From hle_d3d8.c: the shadow device, or NULL, and its swap count. */
+IDirect3DDevice8 *hle_d3d8_shadow_device(void);
+unsigned long hle_d3d8_shadow_swaps(void);
+/* Whether these texels are the frame buffer's -- see hle_d3d8.c. */
+int hle_d3d8_is_framebuffer(uint32_t phys);
+int hle_d3d8_is_device_depth(uint32_t phys, uint32_t size);
+/* From hle_d3d8.c: where the texels of the texture bound to a stage live, so
+ * a draw can tell whether it samples the playing movie. */
+void hle_d3d8_note_stage_texels(uint32_t stage, uint32_t phys);
+int hle_d3d8_trace_on(void);
+
+#define CONTIG_BASE          0x80000000u
+#define CONTIG_SIZE          (64u * 1024u * 1024u)   /* kernel.h XBOX_CONTIG_SIZE */
+#define COMMON_TYPE_MASK     0x00070000u
+#define COMMON_TYPE_TEXTURE  0x00040000u
+#define COMMON_TYPE_SURFACE  0x00050000u
+#define FORMAT_CUBEMAP       0x00000004u
+#define XFMT_P8              0x0B
+#define TEXTURE_CACHE        512
+#define FB_SCREEN            1
+#define FB_DEPTH             2
+#define MAX_STAGES           4
+
+typedef struct {
+    uint32_t           va, data, format, size;   /* guest identity */
+    IDirect3DTexture8 *host;
+    uint32_t           checksum;
+    unsigned long      checked_swap, used_swap;
+    /* The cheap check (texel_sample) and the frame of the last full one;
+     * see texels_changed. */
+    uint32_t           quick;
+    unsigned long      full_swap;
+    /* The title renders into this texture (hle_d3d8_render_texture): the
+     * host texture is a render target, and what shadow mode drew into it is
+     * the content -- the guest's bytes are not, since nothing on the guest
+     * side draws them, so it is never re-uploaded. */
+    int                rendered;
+    /* The texels are the frame buffer's (FB_SCREEN) or the device depth's
+     * (FB_DEPTH), so the content comes from the host's frame or its depth,
+     * refreshed when it is bound after the screen changed. */
+    int                framebuffer;
+    unsigned long      screen_copied;   /* hle_d3d8_screen_changes() at the copy */
+    unsigned long      drawn_swap;      /* a rendered surface: last made the target */
+    /* P8: the host texture holds the texels expanded through a palette, and
+     * this is the checksum of that palette (0: not known, bake again). */
+    int                p8;
+    uint32_t           pal_sum;
+    /* What this entry counts against the texture budget: set only for an
+     * entry uploaded from guest texels, which can be rebuilt from them, and
+     * 0 for everything the host drew (render targets, the frame buffer). */
+    uint32_t           bytes;
+} texture_entry;
+
+static texture_entry g_textures[TEXTURE_CACHE];
+static int           g_texture_count;
+
+/* A memo in front of the lookup by identity (va, data, format, size): with
+ * the cache full, scanning 512 entries at every bind was TimeSplitters 2's
+ * largest host-side cost. A memo holds only while g_tex_gen is what it was
+ * when the memo was made. The generation moves whenever an entry is handed
+ * out, emptied or given another identity, so a memo gives exactly what the
+ * scan would, the first of two matches (a P8 variant) included. */
+#define TEX_MEMO 1024
+typedef struct { uint32_t va, data, format, size, gen; int idx; } tex_memo;
+static tex_memo g_tex_memo[TEX_MEMO];
+static uint32_t g_tex_gen = 1;
+
+static tex_memo *tex_memo_slot(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    uint32_t h = va * 0x9E3779B1u ^ data * 0x85EBCA77u ^ format * 0xC2B2AE3Du ^ size;
+    return &g_tex_memo[(h ^ h >> 16) & (TEX_MEMO - 1)];
+}
+
+/* The first cache entry with this identity and a host texture, or NULL. */
+static texture_entry *tex_lookup(uint32_t va, uint32_t data, uint32_t format, uint32_t size)
+{
+    tex_memo *m = tex_memo_slot(va, data, format, size);
+    int i;
+
+    if (m->gen == g_tex_gen && m->va == va && m->data == data && m->format == format &&
+        m->size == size)
+        return m->idx < 0 ? NULL : &g_textures[m->idx];
+    m->va = va;
+    m->data = data;
+    m->format = format;
+    m->size = size;
+    m->gen = g_tex_gen;
+    m->idx = -1;
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->va == va && c->data == data && c->format == format && c->size == size) {
+            m->idx = i;
+            return c;
+        }
+    }
+    return NULL;
+}
+static IDirect3DTexture8 *g_bound[MAX_STAGES];
+/* The Size word of what each stage last had bound: the image rectangle and
+ * pitch the hardware keeps when SwitchTexture changes only the offset and
+ * format (hle_d3d8_texture_by_state). */
+static uint32_t g_stage_size[MAX_STAGES];
+static texture_entry *g_bound_entry[MAX_STAGES];
+
+/* Each stage's palette: where the guest keeps it (physical, 0 for none) and
+ * the checksum of what the host stage palette holds (0: not known). */
+static uint32_t g_pal_data[MAX_STAGES];
+static uint32_t g_pal_sum[MAX_STAGES];
+static unsigned long g_pal_variants, g_pal_switches, g_pal_rebakes, g_pal_first;
+static unsigned long g_midframe_changes;
+/* Re-uploads of a texture still bound from an earlier frame (refresh_bound). */
+static unsigned long g_held_refreshes;
+
+/* Stage 0 currently holds the title's own frame; see SetTexture below and
+ * hle_d3d8_stage0_is_framebuffer(). */
+static int g_stage0_framebuffer;
+
+static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev);
+
+static unsigned long g_switch_hits, g_switch_misses;   /* D3DDevice_SwitchTexture */
+static unsigned long g_bound_count, g_uploads, g_reuploads, g_skip_type,
+                     g_skip_cube, g_skip_format, g_skip_range, g_skip_create;
+
+typedef struct {
+    uint32_t fmt, width, height, levels, guest_pitch;
+    int      linear;                 /* Size != 0: one level, guest pitch */
+    uint32_t phys, bytes;            /* where the texels are, and how many */
+} texture_layout;
+
+static uint32_t level_dim(uint32_t d, uint32_t level)
+{
+    d >>= level;
+    return d ? d : 1;
+}
+
+static uint32_t level_rows(uint32_t fmt, uint32_t h)
+{
+    return d3d8_format_is_compressed((D3DFORMAT)fmt) ? (h + 3) / 4 : h;
+}
+
+/* Reads the guest pixel container. 0 with a skip counter bumped if the
+ * texture is one this file does not forward. */
+/* Textures known only by their Data and Format, with no object of their own
+ * (D3DDevice_SwitchTexture). Each gets an odd key, which no real object --
+ * dword-aligned guest memory -- can have, and the key stands in for the
+ * object's VA wherever a texture is identified; obj_field reads its fields
+ * from here instead of guest memory. Swizzled and compressed formats only:
+ * their Format word carries every dimension, where a linear one needs the
+ * object's Size. */
+#define SYNTH_MAX 4096
+static struct { uint32_t data, format, size; } g_synth[SYNTH_MAX];
+static int g_synth_count, g_synth_next;
+
+static int is_synth(uint32_t va) { return (va & 1u) != 0u; }
+
+/* `size` is a linear texture's Size word, which its Format does not carry:
+ * 0 for the swizzled and compressed ones. */
+static uint32_t synth_key_sized(uint32_t data, uint32_t format, uint32_t size)
+{
+    /* A direct-mapped memo in front of the scan: a title switches between
+     * the same few hundred textures thousands of times a frame. */
+    static int memo[1024];
+    uint32_t h = ((data >> 7) ^ (data >> 17) ^ (format * 0x9E3779B1u) ^ (size * 0x85EBCA6Bu)) & 1023u;
+    int i = memo[h] - 1;
+
+    if (i >= 0 && i < g_synth_count && g_synth[i].data == data && g_synth[i].format == format &&
+        g_synth[i].size == size)
+        return ((uint32_t)(i + 1) << 4) | 1u;
+    for (i = 0; i < g_synth_count; i++)
+        if (g_synth[i].data == data && g_synth[i].format == format && g_synth[i].size == size) {
+            memo[h] = i + 1;
+            return ((uint32_t)(i + 1) << 4) | 1u;
+        }
+    if (g_synth_count < SYNTH_MAX) {
+        i = g_synth_count++;
+    } else {
+        i = g_synth_next;                 /* reuse the oldest slot */
+        g_synth_next = (g_synth_next + 1) % SYNTH_MAX;
+    }
+    g_synth[i].data = data;
+    g_synth[i].format = format;
+    g_synth[i].size = size;
+    memo[h] = i + 1;
+    return ((uint32_t)(i + 1) << 4) | 1u;
+}
+
+static uint32_t synth_key(uint32_t data, uint32_t format)
+{
+    return synth_key_sized(data, format, 0u);
+}
+
+/* A field of a texture object: Common (+0), Data (+4), Format (+12) or
+ * Size (+16), from guest memory or from the synthetic table. */
+static uint32_t obj_field(uint32_t va, uint32_t off)
+{
+    if (is_synth(va)) {
+        uint32_t i = (va >> 4) - 1u;
+        if (i >= (uint32_t)g_synth_count)
+            return 0;
+        switch (off) {
+        case 0:  return COMMON_TYPE_TEXTURE | 1u;
+        case 4:  return g_synth[i].data;
+        case 12: return g_synth[i].format;
+        case 16: return g_synth[i].size;
+        default: return 0;
+        }
+    }
+    return HLE_MEM32(va + off);
+}
+
+static int read_layout(uint32_t va, texture_layout *t)
+{
+    uint32_t common = obj_field(va, 0);
+    uint32_t data   = obj_field(va, 4);
+    uint32_t format = obj_field(va, 12);
+    uint32_t size   = obj_field(va, 16);
+    uint32_t l;
+    uint64_t bytes = 0;
+
+    /* A D3DSurface is accepted as well as a D3DTexture. On the Xbox both are
+     * D3DPixelContainers with the same Format, Size and Data fields, and the
+     * hardware reads a texture from those three, so a title can hand
+     * SetTexture a surface and it works. TimeSplitters: Future Perfect does:
+     * its colour-grading quad binds the back buffer's surface object
+     * (0x003E5984, common type 5) and samples the scene through it. Refused
+     * here as "not a texture", that bind got the 1x1 white placeholder, and
+     * the whole graded frame came out white -- once per frame, for 3,296 of
+     * the run's skipped binds. */
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE &&
+        (common & COMMON_TYPE_MASK) != COMMON_TYPE_SURFACE) {
+        g_skip_type++;
+        return 0;
+    }
+    if ((format & FORMAT_CUBEMAP) || ((format >> 4) & 0xF) != 2) {
+        /* Say what was refused, once per kind: a skipped bind samples the
+         * 1x1 white placeholder, and in a combiner that adds or multiplies
+         * that stage the draw comes out white with nothing in the log. */
+        static uint32_t seen[16];
+        static int nseen;
+        int k;
+        for (k = 0; k < nseen && seen[k] != format; k++)
+            ;
+        if (k == nseen && nseen < 16) {
+            seen[nseen++] = format;
+            fprintf(stderr, "[HLE-D3D8] texture 0x%08X not mirrored: format word "
+                    "0x%08X (%s, %u dimension(s), format 0x%02X, %u level(s), "
+                    "log2 size %u x %u x %u), Size field 0x%08X; it samples white\n",
+                    va, format, (format & FORMAT_CUBEMAP) ? "cube" : "not cube",
+                    (format >> 4) & 0xF, (format >> 8) & 0xFF, (format >> 16) & 0xF,
+                    (format >> 20) & 0xF, (format >> 24) & 0xF, (format >> 28) & 0xF,
+                    size);
+        }
+        g_skip_cube++;
+        return 0;
+    }
+    memset(t, 0, sizeof *t);
+    t->fmt = (format >> 8) & 0xFF;
+    /* Palettised textures; RECOMP_HLE_D3D8_P8=0 refuses them as before.
+     *
+     * The host side expands P8 to BGRA through d3d8_convert_linear_pixels,
+     * the device keeps four palettes, and D3DDevice_SetPalette at the end of
+     * this file forwards the guest's. Marvel vs Capcom 2 is a sprite fighter
+     * that binds almost nothing else.
+     *
+     * This was off by default because turning it on made MvC2's start-up
+     * worse. That start-up was broken by lifter bugs fixed on 24 Sep 2026
+     * (sar branches, a memcpy jump-table arm, CF after repe cmpsb). With
+     * those fixed, MvC2 runs clean with P8 on and draws its character select
+     * fully textured, where with it off the screen stayed white. */
+    if (t->fmt == XFMT_P8 && !xbox_EnvSwitch("RECOMP_HLE_D3D8_P8", 1)) {
+        g_skip_format++;
+        return 0;
+    }
+    if (d3d8_format_bpp((D3DFORMAT)t->fmt) == 0) {
+        /* Say which format, once each. The count alone says a title's textures
+         * are being refused without saying what to implement. */
+        static uint8_t said[256];
+        if (!said[t->fmt]) {
+            said[t->fmt] = 1;
+            fprintf(stderr, "[HLE-D3D8] texture format 0x%02X refused (no bpp "
+                    "known for it); draws using it are untextured\n", t->fmt);
+            fflush(stderr);
+        }
+        g_skip_format++;
+        return 0;
+    }
+    if (size) {
+        t->linear = 1;
+        t->width  = (size & 0xFFF) + 1;
+        t->height = ((size >> 12) & 0xFFF) + 1;
+        t->guest_pitch = (((size >> 24) & 0xFF) + 1) * 64;
+        t->levels = 1;
+        if (t->guest_pitch < d3d8_row_pitch((D3DFORMAT)t->fmt, t->width)) {
+            g_skip_format++;
+            return 0;
+        }
+        bytes = (uint64_t)t->guest_pitch * level_rows(t->fmt, t->height);
+    } else {
+        t->width  = 1u << ((format >> 20) & 0xF);
+        t->height = 1u << ((format >> 24) & 0xF);
+        t->levels = (format >> 16) & 0xF;
+        if (!t->levels)
+            t->levels = 1;
+        for (l = 0; l < t->levels; l++)
+            bytes += (uint64_t)d3d8_row_pitch((D3DFORMAT)t->fmt, level_dim(t->width, l)) *
+                     level_rows(t->fmt, level_dim(t->height, l));
+    }
+    /* Data is physical; tolerate it arriving with the window's high bits. */
+    t->phys = data & 0x0FFFFFFF;
+    if (!data || (uint64_t)t->phys + bytes > CONTIG_SIZE) {
+        g_skip_range++;
+        return 0;
+    }
+    t->bytes = (uint32_t)bytes;
+    return 1;
+}
+
+/* A checksum of the texture's contents, every byte of every level.
+ *
+ * This used to be FNV-1a over 4096 evenly spaced bytes of level 0, on the
+ * theory that a sample is enough to notice a change. It is not, for a title
+ * that updates a texture a piece at a time. Marvel vs Capcom 2 streams its
+ * fighters' animation frames into their sprite sheets tile by tile, the way
+ * the Dreamcast original wrote VRAM, and most tiles fall between the sampled
+ * bytes: 74 re-uploads in 120 s of fighting, and the sprites (and the load
+ * screen's portraits) showed blocks of stale frames that stayed there, even
+ * with the game paused.
+ *
+ * Word at a time, so hashing the few megabytes a frame binds costs about a
+ * millisecond. RECOMP_HLE_D3D8_TEX_SAMPLED=1 restores the old sample, for
+ * comparison. */
+static uint32_t level0_checksum(const texture_layout *t)
+{
+    static int sampled = -1;
+    const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
+
+    if (sampled < 0)
+        sampled = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_SAMPLED", 0);
+    if (sampled) {
+        uint32_t n = t->linear
+            ? t->guest_pitch * level_rows(t->fmt, t->height)
+            : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
+        uint32_t h = 2166136261u, i, step = n > 4096 ? n / 4096 : 1;
+
+        for (i = 0; i < n; i += step) {
+            h ^= p[i];
+            h *= 16777619u;
+        }
+        return h;
+    }
+    {
+        uint64_t h = 0x9E3779B97F4A7C15ull, w;
+        uint32_t n = t->bytes, i;
+
+        for (i = 0; i + 8 <= n; i += 8) {
+            memcpy(&w, p + i, 8);
+            h = (h ^ w) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        for (; i < n; i++)
+            h = (h ^ p[i]) * 0x100000001B3ull;
+        return (uint32_t)(h ^ (h >> 32));
+    }
+}
+
+/* A cheap look at level 0: 1,024 eight-byte words spread across it.
+ *
+ * It was 4,096 single bytes through one FNV chain, each multiply waiting on
+ * the last; at ~380 binds a frame in an OutRun 2 race that was a millisecond
+ * or two of the main thread. Words cover twice the bytes with a quarter of
+ * the steps, and four independent lanes let the multiplies overlap. */
+static uint32_t texel_sample(const texture_layout *t)
+{
+    const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
+    uint32_t n = t->linear
+        ? t->guest_pitch * level_rows(t->fmt, t->height)
+        : d3d8_row_pitch((D3DFORMAT)t->fmt, t->width) * level_rows(t->fmt, t->height);
+    uint64_t h[4] = { 0xCBF29CE484222325ull, 0x84222325CBF29CE4ull,
+                      0x9E3779B97F4A7C15ull, 0x7F4A7C159E3779B9ull };
+    uint64_t w;
+    uint32_t i, k, words = n / 8, step;
+
+    if (!words) {
+        uint32_t s = 2166136261u;
+        for (i = 0; i < n; i++)
+            s = (s ^ p[i]) * 16777619u;
+        return s;
+    }
+    step = words > 1024 ? words / 1024 : 1;
+    for (i = 0, k = 0; i < words; i += step, k = (k + 1) & 3) {
+        memcpy(&w, p + (size_t)i * 8, 8);
+        h[k] = (h[k] ^ w) * 0x100000001B3ull;
+    }
+    w = h[0] ^ (h[1] * 3) ^ (h[2] * 5) ^ (h[3] * 7);
+    return (uint32_t)(w ^ (w >> 32));
+}
+
+/* Have this texture's texels changed since the host copy was made?
+ *
+ * Every first bind of a frame used to hash the whole texture, every mip of
+ * it: Outrun 2 binds about 380 a frame in a race, many of them 512x512, and
+ * the hashing was a quarter of the main thread -- 5 ms of a 20 ms frame
+ * that had to fit in 16.7 to make 60.
+ *
+ * So the check is tiered. A sample of level 0 is taken at every check, and
+ * the full hash only when the sample moved or the last full one is
+ * RECOMP_HLE_D3D8_TEX_FULL_EVERY frames old (8; 1 = every check, as before).
+ * A texture rewritten wholesale -- a streamed sprite frame, a decoded movie,
+ * a reused slot -- changes the sample and uploads the same frame. A small
+ * edit the sample misses uploads within that many frames instead of the
+ * next. Updates e->checksum, e->quick and e->full_swap. */
+static int texels_changed(texture_entry *e, const texture_layout *t,
+                          unsigned long now)
+{
+    static int full_every = -1;
+    uint32_t quick = texel_sample(t), sum;
+
+    if (full_every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_FULL_EVERY");
+        full_every = v && atoi(v) > 0 ? atoi(v) : 8;
+    }
+    if (quick == e->quick && now - e->full_swap < (unsigned long)full_every)
+        return 0;
+    e->quick = quick;
+    e->full_swap = now;
+    sum = level0_checksum(t);
+    if (sum == e->checksum)
+        return 0;
+    e->checksum = sum;
+    return 1;
+}
+
+static void upload(IDirect3DTexture8 *host, const texture_layout *t)
+{
+    const uint8_t *src = (const uint8_t *)HLE_PTR(CONTIG_BASE + t->phys);
+    uint32_t l, y;
+
+    for (l = 0; l < t->levels; l++) {
+        uint32_t w = level_dim(t->width, l), h = level_dim(t->height, l);
+        uint32_t pitch = d3d8_row_pitch((D3DFORMAT)t->fmt, w);
+        uint32_t rows = level_rows(t->fmt, h);
+        D3DLOCKED_RECT lr;
+
+        if (FAILED(host_LockRect(host, l, &lr, NULL, 0)))
+            return;
+        if (t->linear) {             /* guest rows are padded to 64 bytes */
+            for (y = 0; y < rows; y++)
+                memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+                       src + (size_t)y * t->guest_pitch, pitch);
+        } else {
+            memcpy(lr.pBits, src, (size_t)pitch * rows);
+            src += (size_t)pitch * rows;
+        }
+        host_UnlockRect(host, l);
+    }
+}
+
+static void note_format(const texture_layout *t)
+{
+    static uint32_t seen[32];
+    static int nseen;
+    uint32_t key = t->fmt | (t->levels << 8) | ((uint32_t)t->linear << 12);
+    int i;
+
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == key)
+            return;
+    if (nseen < (int)(sizeof seen / sizeof seen[0])) {
+        seen[nseen++] = key;
+        fprintf(stderr, "[HLE-D3D8] shadow texture: format 0x%02X %ux%u, %u level(s), %s, "
+                "first at physical 0x%08X\n", t->fmt, t->width, t->height, t->levels,
+                t->linear ? "linear" : "swizzled/compressed", t->phys);
+    }
+}
+
+/* Texture memory: a byte budget and an age-out, on top of the entry count.
+ *
+ * The 512 entries alone let textures from levels long gone hold host and GPU
+ * memory until 512 newer ones push them out, and nothing notices the guest
+ * freeing or reusing their memory. So an entry uploaded from guest texels
+ * also counts its bytes (entry_bytes), and:
+ *
+ *   RECOMP_HLE_D3D8_TEX_BUDGET_MB=<n> (default 256, 0 = no budget): while
+ *     uploaded entries hold more than n MB, the least recently bound one is
+ *     released.
+ *   RECOMP_HLE_D3D8_TEX_AGE=<frames> (default 0, off): at the end of a frame,
+ *     an uploaded entry not bound for that many frames is released.
+ *
+ * Only entries that can be rebuilt from guest memory go (evictable): never
+ * one bound to a stage, one used this frame, or anything the host drew --
+ * render target textures and surfaces, the frame buffer copy -- whose content
+ * exists nowhere else. A released texture that comes back is uploaded again
+ * from the guest's bytes, as a new one is, so the cost is a re-upload and
+ * never a wrong picture. A P8 texture's palette variants are entries of
+ * their own and go one at a time like any other.
+ *
+ * The bytes are the mip chain in the guest's packing, P8 at four bytes a
+ * texel because the host expands it. The host keeps a CPU copy as well as the
+ * GPU texture (d3d8_resources.c sys_mem), so what is held is about twice the
+ * figure. Age-out is off by default because the budget already bounds the
+ * memory, and what it adds -- returning a texture's memory sooner -- is paid
+ * for with a re-upload when a title comes back to an old screen. */
+static uint64_t      g_tex_bytes;               /* held by uploaded entries */
+static int           g_tex_holes;               /* entries released and not reused */
+static unsigned long g_evict_full, g_evict_budget, g_evict_age;
+
+static uint64_t tex_budget(void)
+{
+    static int64_t budget = -1;
+    if (budget < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_BUDGET_MB");
+        budget = (int64_t)(v && *v ? strtoul(v, NULL, 0) : 256ul) * 1024 * 1024;
+    }
+    return (uint64_t)budget;
+}
+
+static unsigned long tex_age(void)
+{
+    static long age = -1;
+    if (age < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_AGE");
+        age = v && atol(v) > 0 ? atol(v) : 0;
+    }
+    return (unsigned long)age;
+}
+
+static uint32_t entry_bytes(const texture_layout *t)
+{
+    uint64_t b = (uint64_t)t->bytes * (t->fmt == XFMT_P8 ? 4u : 1u);
+    return b ? (b > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)b) : 1u;
+}
+
+/* An uploaded entry made: its bytes count from now. */
+static void entry_count(texture_entry *e, const texture_layout *t)
+{
+    e->bytes = entry_bytes(t);
+    g_tex_bytes += e->bytes;
+}
+
+/* Releases an entry's host texture and empties the slot. */
+static void entry_release(texture_entry *e)
+{
+    if (e->host)
+        host_ReleaseTexture(e->host);
+    g_tex_bytes -= e->bytes;
+    memset(e, 0, sizeof *e);
+    g_tex_gen++;
+}
+
+/* Whether the budget or the age-out may release this entry; see above. */
+static int evictable(const texture_entry *e, unsigned long now)
+{
+    int s;
+
+    if (!e->host || !e->bytes || e->rendered || e->framebuffer || e->used_swap == now)
+        return 0;
+    for (s = 0; s < MAX_STAGES; s++)
+        if (g_bound[s] == e->host || g_bound_entry[s] == e)
+            return 0;
+    return 1;
+}
+
+/* Releases least recently bound uploaded entries until the budget holds, or
+ * nothing more may go. */
+static void enforce_budget(unsigned long now)
+{
+    uint64_t budget = tex_budget();
+    int i;
+
+    while (budget && g_tex_bytes > budget) {
+        texture_entry *victim = NULL;
+        for (i = 0; i < g_texture_count; i++) {
+            texture_entry *e = &g_textures[i];
+            if (evictable(e, now) && (!victim || e->used_swap < victim->used_swap))
+                victim = e;
+        }
+        if (!victim)
+            return;
+        entry_release(victim);
+        g_tex_holes++;
+        g_evict_budget++;
+    }
+}
+
+/* At the end of a frame: uploaded entries not bound for RECOMP_HLE_D3D8_TEX_AGE
+ * frames go. */
+static void age_out(unsigned long now)
+{
+    unsigned long age = tex_age();
+    int i;
+
+    if (!age)
+        return;
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *e = &g_textures[i];
+        if (evictable(e, now) && now - e->used_swap >= age) {
+            entry_release(e);
+            g_tex_holes++;
+            g_evict_age++;
+        }
+    }
+}
+
+/* A free entry: one the budget or the age-out emptied, else a new one, else
+ * the least recently bound entry that no stage holds, freed. */
+static texture_entry *cache_slot(IDirect3DDevice8 *dev, unsigned long now)
+{
+    texture_entry *victim = NULL;
+    int i, s;
+
+    g_tex_gen++;                 /* the caller gives the slot an identity */
+    if (g_tex_holes) {
+        for (i = 0; i < g_texture_count; i++)
+            if (!g_textures[i].host) {
+                g_tex_holes--;
+                return &g_textures[i];
+            }
+        g_tex_holes = 0;
+    }
+    if (g_texture_count < TEXTURE_CACHE)
+        return &g_textures[g_texture_count++];
+    for (i = 0; i < TEXTURE_CACHE; i++) {
+        texture_entry *e = &g_textures[i];
+        int held = 0;
+        if (!e->host) {          /* empty already (a failed create) */
+            victim = e;
+            break;
+        }
+        for (s = 0; s < MAX_STAGES; s++)
+            held |= g_bound[s] == e->host;
+        if (!held && e->used_swap != now && (!victim || e->used_swap < victim->used_swap))
+            victim = e;
+    }
+    if (!victim)
+        return NULL;
+    (void)dev;
+    if (victim->host)
+        g_evict_full++;
+    entry_release(victim);
+    return victim;
+}
+
+/* A texture whose texels are the frame buffer: created as a render target so
+ * the host can draw the finished frame into it, refreshed once per frame, and
+ * never uploaded from guest memory. */
+/* RECOMP_HLE_D3D8_FB_PROBE=<n>: every n swaps, read back what the screen copy
+ * actually landed in the texture the title samples, and say so.
+ *
+ * This exists because the question "does the frame buffer texture hold the
+ * frame?" could not be answered from a capture. src/replay never performs the
+ * copy -- it is done here, in the HLE -- so a replay samples the captured
+ * guest texels, which are zeros, and cannot tell a broken fill from an absent
+ * one. The answer has to be read out of the running title.
+ *
+ * TimeSplitters 2's three full-screen quads compute out = t0*a + dst*(1-a)
+ * with t0 this texture, so a correct copy makes them a no-op and a black one
+ * makes them multiply the picture by (1-a). That is the difference between a
+ * motion blur and the brightness bug, and it is one number.
+ *
+ * It must read through the surface, not the texture. IDirect3DTexture8's
+ * LockRect returns tex->sys_mem, the upload shadow that UnlockRect pushes to
+ * the GPU; the screen copy writes the GPU texture through a render target
+ * view and never touches it, so that buffer reads as zeros whether the copy
+ * works or not. The surface's LockRect is the one that copies the D3D11
+ * resource into a staging texture and maps it. The first version of this
+ * probe used the texture and "proved" the copy was broken. */
+static void framebuffer_probe(texture_entry *e, unsigned long now)
+{
+    static int every = -1;
+    static unsigned long last;
+    IDirect3DSurface8 *surf = NULL;
+    D3DLOCKED_RECT lr;
+    unsigned long long sum = 0;
+    unsigned samples = 0, nonzero = 0;
+    UINT x, y;
+
+    if (every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_FB_PROBE");
+        every = (v && atoi(v) > 0) ? atoi(v) : 0;
+    }
+    if (!every || (last && now - last < (unsigned long)every))
+        return;
+    last = now;
+
+    if (FAILED(e->host->lpVtbl->GetSurfaceLevel(e->host, 0, &surf)) || !surf) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: no level 0 surface on texture "
+                "0x%08X; the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        every = 0;
+        return;
+    }
+    if (FAILED(surf->lpVtbl->LockRect(surf, &lr, NULL, D3DLOCK_READONLY))) {
+        fprintf(stderr, "[HLE-D3D8] fb probe: cannot read the copy back "
+                "(texture 0x%08X); the fill cannot be checked this way\n", e->va);
+        fflush(stderr);
+        surf->lpVtbl->Release(surf);
+        every = 0;               /* asking again every frame would say the same */
+        return;
+    }
+    /* A sparse grid: enough to tell black from a picture, cheap enough to
+     * leave on. All three colour channels, because this number is meant to be
+     * compared against RECOMP_HLE_D3D8_BRIGHT's reading of the finished frame,
+     * which averages three -- sampling one channel here made the scene look
+     * brighter than the frame by the size of the blue cast alone. */
+    for (y = 0; y < 480u; y += 16) {
+        const uint8_t *row = (const uint8_t *)lr.pBits + (size_t)y * lr.Pitch;
+        for (x = 0; x < 640u; x += 16) {
+            const uint8_t *p = row + (size_t)x * 4u;
+            sum += (unsigned)p[0] + p[1] + p[2];
+            samples += 3;
+            if (p[0] || p[1] || p[2])
+                nonzero++;
+        }
+    }
+    surf->lpVtbl->UnlockRect(surf);
+    surf->lpVtbl->Release(surf);
+
+    /* "Not arriving" means near-enough nothing, not merely dark: a night level
+     * legitimately leaves plenty of black pixels, so the threshold is one in
+     * twenty rather than a majority. */
+    fprintf(stderr, "[HLE-D3D8] fb probe swap %lu: texture 0x%08X holds mean %.1f/255, "
+            "%u of %u pixels non-zero -- %s\n", now, e->va,
+            samples ? (double)sum / samples : 0.0, nonzero, samples / 3u,
+            nonzero * 20u < samples / 3u ? "the copy is not arriving"
+                                         : "the copy has content");
+    fflush(stderr);
+}
+
+static IDirect3DTexture8 *framebuffer_texture(IDirect3DDevice8 *dev, uint32_t va,
+                                              const texture_layout *t, int source)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    texture_entry *e = NULL;
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->va == va && c->framebuffer == source) {
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        e = cache_slot(dev, now);
+        if (!e)
+            return NULL;
+        if (FAILED(host_CreateTexture(dev, t->width, t->height, 1, D3DUSAGE_RENDERTARGET,
+                                      (D3DFORMAT)t->fmt, D3DPOOL_DEFAULT, &e->host)) ||
+            !e->host) {
+            memset(e, 0, sizeof *e);
+            g_skip_create++;
+            return NULL;
+        }
+        e->va = va;
+        e->rendered = 1;
+        e->framebuffer = source;
+        fprintf(stderr, "[HLE-D3D8] the title binds its own %s as a texture "
+                "0x%08X (%ux%u, format 0x%02X, data 0x%08X); filling it from the "
+                "host's\n", source == FB_DEPTH ? "depth buffer" : "frame", va,
+                t->width, t->height, t->fmt, data);
+        fflush(stderr);
+    }
+    if (e->data != data || e->format != format || e->size != size)
+        g_tex_gen++;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->used_swap = now;
+    /* The picture it should hold is the screen as it stands, so it is copied
+     * again whenever the screen has been drawn into or cleared since the last
+     * copy -- not once per frame. A frame that is two Swaps long (Forza:
+     * BYPASSCOPY, then FINISH) binds it in its first half, before the world
+     * is drawn, and again in the composite that follows the world; copied
+     * once, the composite read the empty first-half screen and painted the
+     * race black. A title that binds it several times with no drawing in
+     * between still pays for one copy. */
+    {
+        extern unsigned long hle_d3d8_screen_changes(void);
+        unsigned long changes = hle_d3d8_screen_changes();
+        if (e->checked_swap != now || e->screen_copied != changes) {
+            e->checked_swap = now;
+            e->screen_copied = changes;
+            if (source == FB_DEPTH) {
+                host_CopyDepthToTexture(e->host);
+            } else {
+                host_CopyBackBufferToTexture(e->host);
+                framebuffer_probe(e, now);
+            }
+        }
+    }
+    return e->host;
+}
+
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now);
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now);
+
+/* Whether a texture over frame-buffer memory can be the title reading its
+ * screen. A frame buffer is linear and uncompressed, so a swizzled or DXT
+ * texture there is a texture of its own: memory once a frame buffer, freed
+ * and reused. Max Payne frees its frame buffers for each movie and display
+ * mode, and its graphic novel pages (DXT1 1024x512) land on the old ones;
+ * taken for the screen, each bind asked the host for a DXT1 render target,
+ * which it cannot make. */
+static int can_be_screen(const texture_layout *t)
+{
+    return t->linear && !d3d8_format_is_compressed((D3DFORMAT)t->fmt);
+}
+
+/* RECOMP_TEX_TRACE_DATA=<physical>: how each lookup of a texture over that
+ * memory is answered, once a swap. */
+static int tex_trace_data(uint32_t data, unsigned long now)
+{
+    static long want = -2;
+    static unsigned long last = (unsigned long)-1;
+
+    if (want == -2) {
+        const char *e = getenv("RECOMP_TEX_TRACE_DATA");
+        want = e ? (long)strtoul(e, NULL, 0) : -1;
+    }
+    if (want < 0 || (data & 0x0FFFFFFFu) != (uint32_t)want || now == last)
+        return 0;
+    last = now;
+    return 1;
+}
+
+static IDirect3DTexture8 *host_texture(IDirect3DDevice8 *dev, uint32_t va)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e = NULL;
+    uint32_t data = obj_field(va, 4), format = obj_field(va, 12), size = obj_field(va, 16);
+    int i;
+
+    /* Memory the title rendered into as a bare surface: the host's drawing
+     * is the content (hle_d3d8_render_surface). First, even over frame-buffer
+     * memory: Forza borrows its idle front buffer as a 320x240 scratch target
+     * for its bloom, and the pass after reads it back as a texture of that
+     * shape. Taken for the title's own frame, that read got the screen, not
+     * the downsample. A match needs this exact memory, format and size drawn
+     * into as an offscreen surface, which a title reading its real frame
+     * (Future Perfect, XGRA) never does. */
+    /* Unless that was long ago and the memory is a frame buffer: then it is
+     * the screen again. Rainbow Six 3's loading thread draws into its front
+     * buffer as a bare surface; in the level the same memory is the frame on
+     * screen, sampled by the night and thermal vision for their trail, and
+     * the stale loading screen the surface still held was laid over the
+     * view. */
+    if (!(hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) &&
+          !rendered_surface_recent(data, format, size, now))) {
+        IDirect3DTexture8 *rs = rendered_surface_for(data, format, size, now);
+        if (rs) {
+            if (tex_trace_data(data, now))
+                fprintf(stderr, "[TEX-TRACE] swap %lu va 0x%08X data 0x%08X: a rendered "
+                        "surface over this memory answers\n", now, va, data);
+            return rs;
+        }
+    }
+    /* A colour texture over the device's depth buffer: the title reading
+     * its depth's bytes as colour. Rainbow Six 3's post-process weights its
+     * blur and glow by the depth's top byte this way. The depth is the
+     * host's and was never in guest memory, so those texels were whatever
+     * the memory last held -- a ghost of an old frame over every view, and
+     * the glow cut off straight across the screen -- and they are now the
+     * host's depth in the Z24S8 byte layout, copied when the screen has
+     * changed since (RECOMP_HLE_D3D8_DEPTH_COLOUR=guest: the memory). */
+    {
+        static int mode = -1;
+        if (mode < 0) {
+            const char *e = getenv("RECOMP_HLE_D3D8_DEPTH_COLOUR");
+            mode = e && strcmp(e, "guest") == 0 ? 0 : 1;
+        }
+        /* Not a texture the title has drawn into: that is a picture of its
+         * own, whatever memory it sits in. */
+        if (mode == 1 && hle_d3d8_is_device_depth(data & 0x0FFFFFFFu, size) &&
+            read_layout(va, &t) && can_be_screen(&t) && !d3d8_format_is_depth((D3DFORMAT)t.fmt)) {
+            int drawn = 0;
+            for (i = 0; i < g_texture_count && !drawn; i++)
+                drawn = g_textures[i].host && g_textures[i].va == va && g_textures[i].rendered &&
+                        !g_textures[i].framebuffer;
+            if (!drawn) {
+                IDirect3DTexture8 *dt = framebuffer_texture(dev, va, &t, FB_DEPTH);
+                if (dt)
+                    return dt;
+            }
+        }
+    }
+    /* Before the ordinary lookup, because these are not identified by
+     * their texels -- they have none of their own -- and because they
+     * must be refreshed every frame, which a cache hit would skip. */
+    if (hle_d3d8_is_framebuffer(data & 0x0FFFFFFFu) && read_layout(va, &t) &&
+        can_be_screen(&t)) {
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t, FB_SCREEN);
+        if (fb)
+            return fb;
+    }
+
+    e = tex_lookup(va, data, format, size);
+    /* RECOMP_HLE_D3D8_TEX_PROBE=<w>x<h>: every lookup of a texture that size,
+     * with where its texels are and whether any are non-zero. */
+    {
+        static int pw = -1, ph;
+        if (pw < 0) {
+            const char *v = getenv("RECOMP_HLE_D3D8_TEX_PROBE");
+            pw = 0;
+            if (v) sscanf(v, "%dx%d", &pw, &ph);
+        }
+        if (pw > 0 && read_layout(va, &t) && (int)t.width == pw && (int)t.height == ph) {
+            static unsigned long said;
+            const uint8_t *px = (const uint8_t *)HLE_PTR(CONTIG_BASE + t.phys);
+            uint32_t k, nz = 0;
+            for (k = 0; k < t.bytes; k++)
+                nz += px[k] != 0;
+            if (said++ < 40)
+                fprintf(stderr, "[TEX-PROBE] swap %lu va 0x%08X data 0x%08X phys 0x%08X "
+                        "fmt 0x%02X %s pitch %u: %u of %u bytes non-zero, sum 0x%08X%s%s\n",
+                        now, va, data, t.phys, t.fmt, t.linear ? "linear" : "swizzled",
+                        t.guest_pitch, nz, t.bytes, level0_checksum(&t),
+                        e ? " (cached)" : " (new)", e && e->rendered ? " rendered" : "");
+        }
+    }
+    if (tex_trace_data(data, now))
+        fprintf(stderr, "[TEX-TRACE] swap %lu va 0x%08X data 0x%08X format 0x%08X size 0x%08X: "
+                "%s%s%s quick 0x%08X/0x%08X\n", now, va, data, format, size,
+                e ? "cached" : "new", e && e->rendered ? ", rendered" : "",
+                e && e->framebuffer ? ", frame buffer" : "",
+                e ? e->quick : 0u, read_layout(va, &t) ? texel_sample(&t) : 0u);
+    if (e) {
+        e->used_swap = now;
+        /* RECOMP_HLE_D3D8_TEX_EVERY_BIND=1: check the texels at every bind,
+         * not only the first bind of a frame. A title that rewrites one
+         * texture between two draws of the same frame -- a sprite fighter
+         * streaming each character's animation frame through it -- otherwise
+         * draws the second with the first one's texels. Counted either way
+         * it is on, as "changed mid-frame". */
+        static int every_bind = -1;
+        if (every_bind < 0)
+            every_bind = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_EVERY_BIND", 0);
+        if (!e->rendered && (e->checked_swap != now || every_bind)) {
+            /* RECOMP_HLE_D3D8_TEX_REFRESH=1: upload every bound texture once
+             * a frame regardless of the checksum, to tell a stale cache from
+             * a wrong draw. */
+            static int refresh = -1;
+            int same_frame = e->checked_swap == now;
+            if (refresh < 0)
+                refresh = getenv("RECOMP_HLE_D3D8_TEX_REFRESH") ? 1 : 0;
+            e->checked_swap = now;
+            if (read_layout(va, &t)) {
+                int changed = texels_changed(e, &t, now);
+                if (changed || (refresh && !same_frame)) {
+                    if (same_frame && changed)
+                        g_midframe_changes++;
+                    upload(e->host, &t);
+                    e->pal_sum = 0;     /* baked through whichever palette */
+                    g_reuploads++;
+                }
+            }
+        }
+        return e->host;
+    }
+
+    if (!read_layout(va, &t))
+        return NULL;
+    note_format(&t);
+    /* The title's own frame, bound as a texture. Nothing drew those texels on
+     * the guest side, so they are zeros; the host's frame goes in instead, and
+     * the entry is marked so the zeros never overwrite it. */
+    if (hle_d3d8_is_framebuffer(t.phys) && can_be_screen(&t)) {
+        IDirect3DTexture8 *fb = framebuffer_texture(dev, va, &t, FB_SCREEN);
+        if (fb)
+            return fb;
+    }
+    e = cache_slot(dev, now);
+    if (!e)
+        return NULL;
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = va;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->checksum = level0_checksum(&t);
+    e->quick = texel_sample(&t);
+    /* Spread the full checks: textures made together (a level's load) would
+     * otherwise all take their full hash in the same frame, every 8th frame,
+     * which is a periodic spike rather than a cost spread across frames.
+     * texels_changed keeps each texture's phase from here on. */
+    e->full_swap = now - ((va >> 5) ^ (data >> 12)) % 8u;
+    e->checked_swap = e->used_swap = now;
+    e->p8 = t.fmt == XFMT_P8;
+    e->pal_sum = 0;
+    upload(e->host, &t);
+    g_uploads++;
+    entry_count(e, &t);
+    enforce_budget(now);         /* this one was used now, so it stays */
+    return e->host;
+}
+
+/* Checksum of a guest palette: 256 entries of ARGB8888. Never 0, which means
+ * "not known". */
+#define GREY_RAMP_SUM 0x9E3779B9u
+
+static uint32_t palette_sum(uint32_t phys)
+{
+    const uint8_t *p;
+    uint32_t h = 2166136261u, i;
+
+    if (!phys)
+        return GREY_RAMP_SUM;
+    p = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys);
+    for (i = 0; i < 1024u; i++) {
+        h ^= p[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+/* Give the host's stage palette the guest's current one.
+ *
+ * dev_SetPalette re-expands whatever texture the host has bound to that
+ * stage, and here that would be a texture baked for some other palette --
+ * overwriting it. So the stage is emptied first. */
+static void host_stage_palette(IDirect3DDevice8 *dev, uint32_t stage, uint32_t sum)
+{
+    if (g_pal_sum[stage] == sum)
+        return;
+    host_SetTexture(dev, stage, NULL);
+    host_SetPalette(dev, stage, g_pal_data[stage]
+        ? (const DWORD *)HLE_PTR(CONTIG_BASE + g_pal_data[stage]) : NULL);
+    g_pal_sum[stage] = sum;
+}
+
+/* Expand a P8 entry's texels through the stage's current palette. */
+static void bake(IDirect3DDevice8 *dev, uint32_t stage, texture_entry *e,
+                 const texture_layout *t, uint32_t sum)
+{
+    host_stage_palette(dev, stage, sum);
+    d3d8_base_set_palette((IDirect3DBaseTexture8 *)e->host, stage);
+    upload(e->host, t);
+    e->pal_sum = sum;
+}
+
+/* Make the P8 texture bound to a stage show the palette the guest has for
+ * that stage now. Called before every draw.
+ *
+ * The host expands P8 to BGRA when it uploads, and binding a texture does not
+ * expand it again. The Xbox has no such step: the hardware reads the palette
+ * from memory at every draw. Marvel vs Capcom 2 colours its characters by
+ * drawing one sheet under several palettes, so a single host texture per sheet
+ * either kept the first palette it was baked with or, re-expanded at every
+ * change, spent half the main thread's time in d3d8_convert_linear_pixels.
+ *
+ * So a P8 sheet gets one host texture per palette it is drawn with -- each a
+ * cache entry of its own, found by the palette's checksum and evicted like any
+ * other -- and a draw switches the stage to the one that matches. A palette
+ * edited in place changes the checksum, and so the texture, on the next draw.
+ * The cost per P8 stage per draw is a 1 KB checksum. */
+static void sync_palette(IDirect3DDevice8 *dev, uint32_t stage)
+{
+    texture_entry *e = g_bound_entry[stage], *v = NULL;
+    unsigned long now;
+    texture_layout t;
+    uint32_t sum;
+    int i;
+
+    if (!e || !e->p8 || !e->host)
+        return;
+    sum = palette_sum(g_pal_data[stage]);
+    if (e->pal_sum == sum)
+        return;
+    if (!read_layout(e->va, &t))
+        return;
+    now = hle_d3d8_shadow_swaps();
+
+    /* Just uploaded, through no palette in particular: this one is the
+     * texture for the current palette, not a stale variant of it. */
+    if (!e->pal_sum) {
+        g_pal_first++;
+        bake(dev, stage, e, &t, sum);
+        host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)e->host);
+        return;
+    }
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->p8 && c->pal_sum == sum && c->va == e->va &&
+            c->data == e->data && c->format == e->format && c->size == e->size) {
+            v = c;
+            break;
+        }
+    }
+    if (v) {
+        g_pal_switches++;
+        /* The texels are shared by every variant, and only the one the bind
+         * found was checked this frame. */
+        if (v->checksum != e->checksum) {
+            v->checksum = e->checksum;
+            bake(dev, stage, v, &t, sum);
+            g_pal_rebakes++;
+        }
+    } else {
+        v = cache_slot(dev, now);
+        if (!v)
+            return;
+        if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, 0,
+                                      (D3DFORMAT)t.fmt, D3DPOOL_MANAGED, &v->host)) ||
+            !v->host) {
+            memset(v, 0, sizeof *v);
+            g_skip_create++;
+            return;
+        }
+        v->va = e->va;
+        v->data = e->data;
+        v->format = e->format;
+        v->size = e->size;
+        v->checksum = e->checksum;
+        v->checked_swap = now;
+        v->p8 = 1;
+        bake(dev, stage, v, &t, sum);
+        g_pal_variants++;
+        entry_count(v, &t);
+    }
+    v->used_swap = now;
+    host_stage_palette(dev, stage, sum);
+    host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)v->host);
+    g_bound[stage] = v->host;
+    g_bound_entry[stage] = v;
+    /* After the bind: the variant is used now and the stage holds it. */
+    enforce_budget(now);
+}
+
+/* At the end of a frame: which textures this frame drew with have different
+ * texels now than when it drew with them?
+ *
+ * The shadow renderer draws at the call; the NV2A draws when it reaches the
+ * command in the push buffer, which can be after the CPU has written a
+ * texture it was told to draw with. A title that queues a sprite's draws and
+ * only then writes that frame's tiles is correct on the console and one frame
+ * behind here. This counts it, so the question has a number. */
+static unsigned long g_changed_after_draw, g_frames_changed_after_draw;
+
+void hle_d3d8_texture_frame_end(void)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    int i, any = 0;
+    static int on = -1;
+
+    /* RECOMP_HLE_D3D8_TEX_AFTER_DRAW=1. It hashes every texture the frame
+     * used a second time, for a count, and was a fifth of Outrun 2's main
+     * thread in a race; so it is asked for, not paid for by default. */
+    age_out(now);
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_TEX_AFTER_DRAW", 0);
+    if (!on)
+        return;
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *e = &g_textures[i];
+        if (!e->host || e->rendered || e->framebuffer || e->used_swap != now)
+            continue;
+        if (!read_layout(e->va, &t) || level0_checksum(&t) == e->checksum)
+            continue;
+        g_changed_after_draw++;
+        any = 1;
+    }
+    if (any)
+        g_frames_changed_after_draw++;
+}
+
+/* A texture left bound from an earlier frame, checked again at the first
+ * draw of this frame that uses it. host_texture checks the texels when
+ * SetTexture binds a texture, but the NV2A reads them when it draws: Max
+ * Payne binds its Bink movie texture once and has the decoder rewrite it
+ * every frame, so the host drew the first, empty picture for the whole movie
+ * and every movie was black. Once a frame, as for a texture bound anew. */
+static void refresh_bound(uint32_t s)
+{
+    texture_entry *e = g_bound_entry[s];
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+
+    if (!e || !e->host || e->host != g_bound[s] || e->rendered || e->framebuffer ||
+        e->checked_swap == now)
+        return;
+    e->checked_swap = now;
+    e->used_swap = now;
+    if (read_layout(e->va, &t) && texels_changed(e, &t, now)) {
+        upload(e->host, &t);
+        e->pal_sum = 0;     /* baked through whichever palette */
+        g_reuploads++;
+        g_held_refreshes++;
+    }
+}
+
+static void op_sync_palettes(const void *arg)
+{
+    uint32_t s;
+    IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+
+    (void)arg;
+    if (!dev)
+        return;
+    for (s = 0; s < MAX_STAGES; s++) {
+        refresh_bound(s);
+        sync_palette(dev, s);
+    }
+}
+
+/* Before a draw. Deferred, it runs where the draw runs, so the palette is
+ * read when the draw is executed. */
+void hle_d3d8_sync_palettes(IDirect3DDevice8 *dev)
+{
+    if (!dev)
+        return;
+    if (hle_d3d8_defer_recording())
+        hle_d3d8_defer_op(op_sync_palettes, NULL, 0);
+    else
+        op_sync_palettes(NULL);
+}
+
+/* The palette a stage uses, in order with the draws around it. */
+static void op_set_pal_data(const void *arg)
+{
+    const uint32_t *a = (const uint32_t *)arg;
+    g_pal_data[a[0]] = a[1];
+}
+
+static void set_pal_data(uint32_t stage, uint32_t data)
+{
+    uint32_t a[2];
+
+    a[0] = stage;
+    a[1] = data;
+    if (hle_d3d8_defer_recording())
+        hle_d3d8_defer_op(op_set_pal_data, a, sizeof a);
+    else
+        op_set_pal_data(a);
+}
+
+/* Cube textures a title renders into: its environment map. Only rendered
+ * cubes are mirrored -- a cube the title uploads from guest memory still
+ * binds white -- so the entries carry no contents and are never re-uploaded.
+ * Kept apart from the 2D cache above, which is keyed and evicted by texel
+ * checksums that mean nothing here. */
+#define CUBE_CACHE      8
+#define CUBE_FACE_ALIGN 128u        /* nv2a_regs.h NV2A_CUBEMAP_FACE_ALIGNMENT */
+
+static struct {
+    uint32_t va, data, format;
+    IDirect3DCubeTexture8 *host;    /* NULL with tried set: the host refused it */
+    int      tried;
+} g_cubes[CUBE_CACHE];
+static int g_cube_count;
+static unsigned long g_cube_full, g_cube_failed;
+static unsigned long g_cube_binds;
+
+/* Which face and level of a cube container a surface is. The Xbox lays the
+ * six faces out one after another in the container's data, each holding that
+ * face's whole mip chain, and each face starts on a 128-byte boundary
+ * (src/nv2a/nv2a_regs.h, NV2A_CUBEMAP_FACE_ALIGNMENT). So the distance
+ * between the surface's data pointer and the container's says which face and
+ * which level this is.
+ *
+ * Burnout 2's cube cannot show the padding: one 128x128 R5G6B5 face is 32768
+ * bytes, which is already a multiple of 128, so its deltas look the same
+ * either way. The alignment is taken from the register header rather than
+ * from that measurement. A mipped cube is where the two differ -- 8 levels of
+ * 128x128 R5G6B5 is 43690 bytes, padded to 43776.
+ *
+ * 0 on success with *face and *level filled, -1 for a surface this does not
+ * describe. */
+int hle_d3d8_cube_face(uint32_t parent_va, uint32_t surface_va,
+                       uint32_t *face, uint32_t *level)
+{
+    uint32_t format = HLE_MEM32(parent_va + 12);
+    uint32_t size   = HLE_MEM32(parent_va + 16);
+    uint32_t fmt    = (format >> 8) & 0xFF;
+    uint32_t levels = (format >> 16) & 0xF;
+    uint32_t w      = 1u << ((format >> 20) & 0xF);
+    uint32_t h      = 1u << ((format >> 24) & 0xF);
+    uint32_t pdata  = HLE_MEM32(parent_va + 4);
+    uint32_t sdata  = HLE_MEM32(surface_va + 4);
+    uint32_t chain = 0, stride, offset, delta, l;
+
+    /* A linear container keeps its size in Size, not in the format's log2
+     * fields; reading those would size every face 1x1. */
+    if (size || !levels || sdata < pdata)
+        return -1;
+    for (l = 0; l < levels; l++)
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
+                 level_rows(fmt, level_dim(h, l));
+    if (!chain)
+        return -1;
+    stride = (chain + (CUBE_FACE_ALIGN - 1u)) & ~(CUBE_FACE_ALIGN - 1u);
+    delta  = sdata - pdata;
+    if (delta / stride >= 6u)
+        return -1;
+    *face  = delta / stride;
+    offset = delta % stride;
+
+    /* The remainder names a level: the start of one of the face's mips. */
+    for (l = 0, chain = 0; l < levels; l++) {
+        if (offset == chain) {
+            *level = l;
+            return 0;
+        }
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(w, l)) *
+                 level_rows(fmt, level_dim(h, l));
+    }
+    return -1;
+}
+
+/* The host cube for a guest cube container, created on first use. NULL if
+ * there is no room or the host refuses it. */
+IDirect3DCubeTexture8 *hle_d3d8_render_cube(IDirect3DDevice8 *dev, uint32_t va)
+{
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12);
+    uint32_t edge = 1u << ((format >> 20) & 0xF);
+    uint32_t levels = (format >> 16) & 0xF;
+    uint32_t fmt = (format >> 8) & 0xFF;
+    int i;
+
+    for (i = 0; i < g_cube_count; i++)
+        if (g_cubes[i].va == va && g_cubes[i].data == data &&
+            g_cubes[i].format == format)
+            return g_cubes[i].host;      /* NULL if the host refused it before */
+    if (!levels || HLE_MEM32(va + 16)) {
+        g_skip_cube++;                   /* no levels, or a linear container */
+        return NULL;
+    }
+    if (g_cube_count >= CUBE_CACHE) {
+        if (!g_cube_full++)
+            fprintf(stderr, "[HLE-D3D8] shadow cubes: the cache holds %d and this "
+                    "title wants more; 0x%08X and any after it draw to a scratch "
+                    "target and sample white\n", CUBE_CACHE, va);
+        return NULL;
+    }
+    /* The entry is kept whatever happens: a format the host refuses would
+     * otherwise be retried on every face of every frame. */
+    g_cubes[g_cube_count].va = va;
+    g_cubes[g_cube_count].data = data;
+    g_cubes[g_cube_count].format = format;
+    g_cubes[g_cube_count].tried = 1;
+    if (FAILED(host_CreateCubeTexture(dev, edge, levels, D3DUSAGE_RENDERTARGET,
+                                      (D3DFORMAT)fmt, D3DPOOL_DEFAULT,
+                                      &g_cubes[g_cube_count].host)) ||
+        !g_cubes[g_cube_count].host) {
+        g_cubes[g_cube_count].host = NULL;
+        g_cube_count++;
+        g_skip_create++;
+        g_cube_failed++;
+        return NULL;
+    }
+    fprintf(stderr, "[HLE-D3D8] shadow render target cube 0x%08X: format 0x%02X "
+            "%ux%u, %u level(s)\n", va, fmt, edge, edge, levels);
+    return g_cubes[g_cube_count++].host;
+}
+
+/* The host cube for a guest container the title is binding, if one was
+ * rendered into. NULL means "not a cube this file mirrors". */
+static IDirect3DCubeTexture8 *bound_cube(uint32_t va)
+{
+    uint32_t common = HLE_MEM32(va + 0), data = HLE_MEM32(va + 4);
+    uint32_t format = HLE_MEM32(va + 12);
+    int i;
+
+    /* The container still has to read as a cube texture: after the guest
+     * frees this one, whatever lands at the address could otherwise match on
+     * data and format alone and be handed a stale cube. */
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE ||
+        !(format & FORMAT_CUBEMAP))
+        return NULL;
+    for (i = 0; i < g_cube_count; i++)
+        if (g_cubes[i].host && g_cubes[i].va == va && g_cubes[i].data == data &&
+            g_cubes[i].format == format)
+            return g_cubes[i].host;
+    return NULL;
+}
+
+/* Cube textures a title fills from memory rather than rendering into: an
+ * environment map loaded with the rest of a level. OutRun 2 binds two static
+ * DXT5 ones in a race, and while they were refused (read_layout does not
+ * take cubes) the stage read nothing and the road came out pale.
+ *
+ * The layout is hle_d3d8_cube_face's: six faces one after another, each
+ * with its whole mip chain, each starting on a 128-byte boundary. The host
+ * cube's LockRect/UnlockRect take one face level at a time in the guest's
+ * own format and swizzle, and unswizzle it on unlock as a 2D level would be.
+ *
+ * Kept apart from the rendered cubes above, which carry no contents and
+ * are looked up first: a cube the title renders into is that, whatever it
+ * held before. Rechecked by checksum every RECOMP_HLE_D3D8_TEX_FULL_EVERY
+ * frames it is bound (8 by default), since static cubes are static. */
+#define STATIC_CUBE_CACHE 32
+
+static struct {
+    uint32_t va, data, format;
+    IDirect3DCubeTexture8 *host;    /* NULL: the host refused it, do not retry */
+    uint32_t checksum;
+    unsigned long checked_swap;
+} g_static_cubes[STATIC_CUBE_CACHE];
+static int g_static_cube_count;
+static unsigned long g_static_cube_uploads, g_static_cube_reuploads, g_static_cube_full;
+
+/* Bytes in one face's mip chain, unpadded. */
+static uint32_t cube_chain_bytes(uint32_t fmt, uint32_t edge, uint32_t levels)
+{
+    uint32_t l, chain = 0;
+
+    for (l = 0; l < levels; l++)
+        chain += d3d8_row_pitch((D3DFORMAT)fmt, level_dim(edge, l)) *
+                 level_rows(fmt, level_dim(edge, l));
+    return chain;
+}
+
+static uint32_t guest_bytes_hash(uint32_t phys, uint32_t n)
+{
+    const uint8_t *p = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys);
+    uint64_t h = 0x9E3779B97F4A7C15ull, w;
+    uint32_t i;
+
+    for (i = 0; i + 8 <= n; i += 8) {
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return (uint32_t)(h ^ (h >> 32));
+}
+
+static void upload_static_cube(IDirect3DCubeTexture8 *host, uint32_t phys, uint32_t fmt,
+                               uint32_t edge, uint32_t levels, uint32_t stride)
+{
+    uint32_t face, l;
+
+    for (face = 0; face < 6; face++) {
+        const uint8_t *src = (const uint8_t *)HLE_PTR(CONTIG_BASE + phys + face * stride);
+
+        for (l = 0; l < levels; l++) {
+            uint32_t d = level_dim(edge, l);
+            uint32_t pitch = d3d8_row_pitch((D3DFORMAT)fmt, d);
+            uint32_t rows = level_rows(fmt, d), y;
+            D3DLOCKED_RECT lr;
+
+            if (FAILED(host_CubeLockRect(host, (D3DCUBEMAP_FACES)face, l, &lr)))
+                return;
+            if ((uint32_t)lr.Pitch == pitch) {
+                memcpy(lr.pBits, src, (size_t)pitch * rows);
+            } else {
+                for (y = 0; y < rows; y++)
+                    memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch,
+                           src + (size_t)y * pitch, pitch);
+            }
+            host_CubeUnlockRect(host, (D3DCUBEMAP_FACES)face, l);
+            src += (size_t)pitch * rows;
+        }
+    }
+}
+
+/* The host copy of a static guest cube, made or refreshed. NULL if the
+ * container is not one this can mirror. */
+static IDirect3DCubeTexture8 *static_cube(IDirect3DDevice8 *dev, uint32_t va)
+{
+    static int full_every = -1;
+    uint32_t common = HLE_MEM32(va + 0), data = HLE_MEM32(va + 4);
+    uint32_t format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+    uint32_t fmt = (format >> 8) & 0xFF, levels = (format >> 16) & 0xF;
+    uint32_t edge = 1u << ((format >> 20) & 0xF);
+    uint32_t phys = data & 0x0FFFFFFFu, chain, stride, total;
+    unsigned long now = hle_d3d8_shadow_swaps();
+    int i;
+
+    if (full_every < 0) {
+        const char *v = getenv("RECOMP_HLE_D3D8_TEX_FULL_EVERY");
+        full_every = v && atoi(v) > 0 ? atoi(v) : 8;
+    }
+    if ((common & COMMON_TYPE_MASK) != COMMON_TYPE_TEXTURE || !(format & FORMAT_CUBEMAP) ||
+        size || !levels || !data || d3d8_format_bpp((D3DFORMAT)fmt) == 0)
+        return NULL;
+    chain = cube_chain_bytes(fmt, edge, levels);
+    stride = (chain + (CUBE_FACE_ALIGN - 1u)) & ~(CUBE_FACE_ALIGN - 1u);
+    total = 5u * stride + chain;
+    if (!chain || (uint64_t)phys + total > CONTIG_SIZE)
+        return NULL;
+
+    for (i = 0; i < g_static_cube_count; i++)
+        if (g_static_cubes[i].va == va && g_static_cubes[i].data == data &&
+            g_static_cubes[i].format == format)
+            break;
+    if (i < g_static_cube_count) {
+        IDirect3DCubeTexture8 *host = g_static_cubes[i].host;
+
+        if (host && now - g_static_cubes[i].checked_swap >= (unsigned long)full_every) {
+            uint32_t sum = guest_bytes_hash(phys, total);
+
+            g_static_cubes[i].checked_swap = now;
+            if (sum != g_static_cubes[i].checksum) {
+                g_static_cubes[i].checksum = sum;
+                upload_static_cube(host, phys, fmt, edge, levels, stride);
+                g_static_cube_reuploads++;
+            }
+        }
+        return host;
+    }
+    if (g_static_cube_count >= STATIC_CUBE_CACHE) {
+        if (!g_static_cube_full++)
+            fprintf(stderr, "[HLE-D3D8] static cubes: the cache holds %d and this "
+                    "title wants more; 0x%08X and any after it sample nothing\n",
+                    STATIC_CUBE_CACHE, va);
+        return NULL;
+    }
+    g_static_cubes[i].va = va;
+    g_static_cubes[i].data = data;
+    g_static_cubes[i].format = format;
+    g_static_cubes[i].checked_swap = now;
+    g_static_cubes[i].checksum = guest_bytes_hash(phys, total);
+    g_static_cube_count++;
+    if (FAILED(host_CreateCubeTexture(dev, edge, levels, 0, (D3DFORMAT)fmt,
+                                      D3DPOOL_MANAGED, &g_static_cubes[i].host)) ||
+        !g_static_cubes[i].host) {
+        g_static_cubes[i].host = NULL;
+        g_skip_create++;
+        return NULL;
+    }
+    upload_static_cube(g_static_cubes[i].host, phys, fmt, edge, levels, stride);
+    g_static_cube_uploads++;
+    fprintf(stderr, "[HLE-D3D8] static cube 0x%08X mirrored: format 0x%02X %ux%u, "
+            "%u level(s), face stride %u\n", va, fmt, edge, edge, levels, stride);
+    return g_static_cubes[i].host;
+}
+
+/* The host render target for a 2D guest texture the title renders into, for
+ * hle_d3d8.c's SetRenderTarget. The same cache entry SetTexture finds, so a
+ * texture drawn into and then bound samples what was drawn. A texture already
+ * cached as an ordinary one is recreated as a render target. NULL (counted)
+ * if the texture is not one this file can mirror. */
+IDirect3DTexture8 *hle_d3d8_render_texture(IDirect3DDevice8 *dev, uint32_t va)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e = NULL;
+    uint32_t data = HLE_MEM32(va + 4), format = HLE_MEM32(va + 12), size = HLE_MEM32(va + 16);
+
+    e = tex_lookup(va, data, format, size);
+    if (e && e->rendered) {
+        e->used_swap = now;
+        return e->host;
+    }
+    if (!read_layout(va, &t))
+        return NULL;
+    if (!e) {
+        e = cache_slot(dev, now);
+        if (!e)
+            return NULL;
+    } else {
+        int s;
+        /* The host device keeps a plain pointer to each bound texture, so a
+         * stage holding this one is moved off it before it is released. It
+         * gets white, as an unmirrored texture does, until the title binds
+         * again. */
+        for (s = 0; s < MAX_STAGES; s++)
+            if (g_bound[s] == e->host) {
+                g_bound[s] = NULL;
+                host_SetTexture(dev, (DWORD)s, (IDirect3DBaseTexture8 *)white_texture(dev));
+            }
+        entry_release(e);
+    }
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, t.levels, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = va;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->rendered = 1;
+    e->checked_swap = e->used_swap = now;
+    fprintf(stderr, "[HLE-D3D8] shadow render target texture 0x%08X: format 0x%02X "
+            "%ux%u, %u level(s)\n", va, t.fmt, t.width, t.height, t.levels);
+    return e->host;
+}
+
+/* Whether two pixel containers describe the same pixels: the format and the
+ * dimensions, not the mip count or the container's own bits. */
+static int same_pixels(uint32_t fa, uint32_t sa, uint32_t fb, uint32_t sb)
+{
+    if (((fa >> 8) & 0xFFu) != ((fb >> 8) & 0xFFu))
+        return 0;
+    if (sa || sb)
+        return sa == sb;
+    return ((fa >> 20) & 0xFFu) == ((fb >> 20) & 0xFFu);
+}
+
+/* A render target the title made as a bare surface (no parent texture), and
+ * samples through a texture object of its own over the same memory -- the
+ * NV2A reads texels from an address, so the two are one image. Need for
+ * Speed Underground 2 builds its reflections and bloom that way: 320x240
+ * LIN_A8R8G8B8 surfaces at 0x003EA400 and friends, bound back as textures
+ * at 0x003E75DC (same data 0x02B85700). Sent to a scratch target, what was
+ * drawn was thrown away and the texture read the guest's bytes -- the
+ * allocator's 0xAA fill, a flat grey across the menu's floor.
+ *
+ * The entry is keyed by the pixels (data, format, size), with va 0, and
+ * host_texture finds it from any texture or surface over that memory. NULL
+ * (counted) if the surface is not one this file can mirror. */
+IDirect3DTexture8 *hle_d3d8_render_surface(IDirect3DDevice8 *dev, uint32_t surface)
+{
+    unsigned long now = hle_d3d8_shadow_swaps();
+    texture_layout t;
+    texture_entry *e;
+    uint32_t data = HLE_MEM32(surface + 4), format = HLE_MEM32(surface + 12);
+    uint32_t size = HLE_MEM32(surface + 16);
+    IDirect3DTexture8 *have = rendered_surface_for(data, format, size, now);
+
+    if (have) {
+        rendered_surface_drawn(data, format, size, now);
+        return have;
+    }
+    if (!read_layout(surface, &t))
+        return NULL;
+    e = cache_slot(dev, now);
+    if (!e)
+        return NULL;
+    if (FAILED(host_CreateTexture(dev, t.width, t.height, 1, D3DUSAGE_RENDERTARGET,
+                                  (D3DFORMAT)t.fmt, D3DPOOL_DEFAULT, &e->host)) ||
+        !e->host) {
+        memset(e, 0, sizeof *e);
+        g_skip_create++;
+        return NULL;
+    }
+    e->va = 0;
+    e->data = data;
+    e->format = format;
+    e->size = size;
+    e->rendered = 1;
+    e->checked_swap = e->used_swap = e->drawn_swap = now;
+    fprintf(stderr, "[HLE-D3D8] shadow render target surface 0x%08X: format 0x%02X %ux%u "
+            "at 0x%08X, sampled by any texture over that memory\n",
+            surface, t.fmt, t.width, t.height, data);
+    return e->host;
+}
+
+/* hle_d3d8_render_surface made that surface the target again. */
+static void rendered_surface_drawn(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            c->drawn_swap = now;
+    }
+}
+
+/* Whether the rendered surface over this memory has been drawn into lately:
+ * within the last two Swaps. */
+static int rendered_surface_recent(uint32_t data, uint32_t format, uint32_t size,
+                                   unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size))
+            return now - c->drawn_swap <= 2u;
+    }
+    return 0;
+}
+
+/* The host render target a texture's memory was drawn into as a bare
+ * surface (hle_d3d8_render_surface), or NULL. */
+static IDirect3DTexture8 *rendered_surface_for(uint32_t data, uint32_t format, uint32_t size,
+                                               unsigned long now)
+{
+    int i;
+
+    for (i = 0; i < g_texture_count; i++) {
+        texture_entry *c = &g_textures[i];
+        if (c->host && c->rendered && c->va == 0 && c->data == data &&
+            same_pixels(c->format, c->size, format, size)) {
+            c->used_swap = now;
+            return c->host;
+        }
+    }
+    return NULL;
+}
+
+/* 1x1 opaque white, created once, never evicted. */
+static IDirect3DTexture8 *white_texture(IDirect3DDevice8 *dev)
+{
+    static IDirect3DTexture8 *white;
+    static int tried;
+    D3DLOCKED_RECT lr;
+
+    if (white || tried)
+        return white;
+    tried = 1;
+    if (FAILED(host_CreateTexture(dev, 1, 1, 1, 0, D3DFMT_LIN_A8R8G8B8,
+                                  D3DPOOL_MANAGED, &white)) || !white) {
+        white = NULL;
+        return NULL;
+    }
+    if (SUCCEEDED(host_LockRect(white, 0, &lr, NULL, 0))) {
+        memset(lr.pBits, 0xFF, 4);
+        host_UnlockRect(white, 0);
+    }
+    return white;
+}
+
+static void report(void)
+{
+    static DWORD last;
+    DWORD now = GetTickCount();
+
+    if (!last) {
+        last = now;
+    } else if (now - last >= 5000) {
+        fprintf(stderr, "[HLE-D3D8] shadow textures: %lu binds, %d cached, %lu uploads, "
+                "%lu re-uploads; skipped %lu not a texture, %lu cube/volume, %lu format, "
+                "%lu out of range, %lu create failed\n",
+                g_bound_count, g_texture_count, g_uploads, g_reuploads, g_skip_type,
+                g_skip_cube, g_skip_format, g_skip_range, g_skip_create);
+        {
+            int i, uploaded = 0, drawn = 0;
+            for (i = 0; i < g_texture_count; i++) {
+                if (!g_textures[i].host)
+                    continue;
+                if (g_textures[i].bytes)
+                    uploaded++;
+                else
+                    drawn++;
+            }
+            fprintf(stderr, "[HLE-D3D8] shadow texture memory: %.1f MB in %d uploaded "
+                    "entries (budget %llu MB%s), %d drawn by the host; released %lu "
+                    "for a slot, %lu over budget, %lu unbound %lu frames%s\n",
+                    (double)g_tex_bytes / (1024.0 * 1024.0), uploaded,
+                    (unsigned long long)(tex_budget() >> 20), tex_budget() ? "" : ", off",
+                    drawn, g_evict_full, g_evict_budget, g_evict_age, tex_age(),
+                    tex_age() ? "" : " (age-out off)");
+        }
+        if (g_switch_hits || g_switch_misses)
+            fprintf(stderr, "[HLE-D3D8] SwitchTexture: %lu bound, %lu matched no mirrored "
+                    "texture\n", g_switch_hits, g_switch_misses);
+        fprintf(stderr, "[HLE-D3D8] shadow cubes: %d rendered into, %lu binds, "
+                "%lu refused by the host, %lu past the cache\n",
+                g_cube_count, g_cube_binds, g_cube_failed, g_cube_full);
+        if (g_frames_changed_after_draw)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed after the frame "
+                    "drew with them, in %lu frames\n", g_changed_after_draw,
+                    g_frames_changed_after_draw);
+        if (g_midframe_changes)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu changed mid-frame "
+                    "(RECOMP_HLE_D3D8_TEX_EVERY_BIND)\n", g_midframe_changes);
+        if (g_held_refreshes)
+            fprintf(stderr, "[HLE-D3D8] shadow textures: %lu re-uploaded at a draw, still "
+                    "bound from an earlier frame\n", g_held_refreshes);
+        if (g_pal_variants || g_pal_switches || g_pal_first)
+            fprintf(stderr, "[HLE-D3D8] shadow palettes: %lu baked after upload, "
+                    "%lu more made for another palette, %lu draws switched to "
+                    "one, %lu re-baked for new texels\n",
+                    g_pal_first, g_pal_variants, g_pal_switches, g_pal_rebakes);
+        last = now;
+    }
+}
+
+HLE_ORIGINAL(D3DDevice_SetTexture);
+
+static void shadow_set_texture(uint32_t stage, uint32_t texture);
+static void op_set_texture(const void *arg)
+{
+    const uint32_t *a = (const uint32_t *)arg;
+    shadow_set_texture(a[0], a[1]);
+}
+
+/* HRESULT D3DDevice_SetTexture(DWORD Stage, IDirect3DBaseTexture8 *pTexture) */
+static uint32_t g_pending_texture[MAX_STAGES];
+static uint32_t g_pending_mask;
+
+static int lazy_textures_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = xbox_EnvSwitch("RECOMP_HLE_D3D8_LAZY_TEXTURES", 1);
+    return on;
+}
+
+/* Binds the XDK flushed into the push buffer (CDevice_SetStateVB), held with
+ * the span it wrote until the walk reaches it.
+ *
+ * Made when SetStateVB was called, they overtook what the buffer held before
+ * that span and the walk had not drawn yet: a draw the title pushed itself,
+ * reached by a later walk, ran with the next object's textures. The XDK only
+ * writes a stage it thinks has changed, so the walk cannot always put the
+ * bind right from the methods alone. Turok: Evolution's terrain swapped two
+ * meshes' textures for one frame in forty or so -- a patch of bare ground or
+ * a missing water surface flickering in. */
+#define TEX_QUEUE 32u
+static struct { uint32_t lo, hi, mask, tex[MAX_STAGES]; } g_tex_q[TEX_QUEUE];
+static uint32_t g_tex_n;
+static unsigned long g_tex_by_walk;
+
+static void tex_queue_apply(uint32_t i)
+{
+    uint32_t stage;
+
+    for (stage = 0; stage < MAX_STAGES; stage++)
+        if (g_tex_q[i].mask & (1u << stage))
+            shadow_set_texture(stage, g_tex_q[i].tex[stage]);
+}
+
+/* Everything still held: the walk ended, or an API call is about to draw. */
+void hle_d3d8_texture_queue_flush(void)
+{
+    uint32_t i;
+
+    for (i = 0; i < g_tex_n; i++)
+        tex_queue_apply(i);
+    g_tex_n = 0;
+}
+
+/* The walk has reached addr: the binds held for a span holding it are made
+ * now, with every one held before them. A range that wrapped round the
+ * buffer has hi below lo. */
+void hle_d3d8_texture_queue_reach(uint32_t addr)
+{
+    uint32_t i, k;
+
+    for (i = 0; i < g_tex_n; i++) {
+        uint32_t lo = g_tex_q[i].lo, hi = g_tex_q[i].hi;
+        if (lo <= hi ? (addr >= lo && addr < hi) : (addr >= lo || addr < hi))
+            break;
+    }
+    if (i == g_tex_n)
+        return;
+    for (k = 0; k <= i; k++)
+        tex_queue_apply(k);
+    g_tex_n -= i + 1u;
+    memmove(&g_tex_q[0], &g_tex_q[i + 1u], g_tex_n * sizeof g_tex_q[0]);
+}
+
+/* SetStateVB wrote [lo, hi): the binds SetTexture recorded go with that span,
+ * for the walk. 0 when they cannot be held, and are to be made at once. */
+int hle_d3d8_texture_queue_span(uint32_t lo, uint32_t hi)
+{
+    uint32_t stage;
+
+    if (!g_pending_mask)
+        return 1;
+    if (g_tex_n >= TEX_QUEUE)
+        return 0;
+    g_tex_q[g_tex_n].lo = lo;
+    g_tex_q[g_tex_n].hi = hi;
+    g_tex_q[g_tex_n].mask = g_pending_mask;
+    for (stage = 0; stage < MAX_STAGES; stage++)
+        g_tex_q[g_tex_n].tex[stage] = g_pending_texture[stage];
+    g_tex_n++;
+    g_tex_by_walk++;
+    g_pending_mask = 0;
+    return 1;
+}
+
+/* The binds SetTexture recorded, made now: an API call is about to draw, or
+ * the XDK has flushed its state. Any held for the walk go first: they were
+ * recorded before these. */
+void hle_d3d8_apply_pending_textures(void)
+{
+    uint32_t stage;
+
+    hle_d3d8_texture_queue_flush();
+    if (!g_pending_mask)
+        return;
+    for (stage = 0; stage < MAX_STAGES; stage++)
+        if (g_pending_mask & (1u << stage))
+            shadow_set_texture(stage, g_pending_texture[stage]);
+    g_pending_mask = 0;
+}
+
+HLE_EXPORT(D3DDevice_SetTexture)
+{
+    static int seen;
+    uint32_t stage = HLE_ARG(0);
+    uint32_t texture = HLE_ARG(1);
+
+    if (!seen) {
+        seen = 1;
+        fprintf(stderr, "[HLE] D3DDevice_SetTexture(0x%X) replaced by name\n", stage);
+    }
+    if (!hle_original_D3DDevice_SetTexture) {
+        fprintf(stderr, "[HLE] D3DDevice_SetTexture: original body missing -- regenerate the lift\n");
+        HLE_RETURN(0x80004005u);
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SetTexture);
+    /* Lazy, as the XDK's own is: SetTexture only records the texture, and the
+     * XDK writes it into the push buffer when it next draws. Until then the
+     * title's own pushed draws still run with what the stage had -- Turok:
+     * Evolution sets a soldier's skin through the API while the last of a
+     * row of grass clumps it pushed itself is still queued, and bound at
+     * once the skin went onto the grass. So the bind waits for the next draw
+     * an API call makes, or for CDevice_SetStateVB, where the XDK flushes
+     * its state; the XDK's flush, written into the push buffer, also binds
+     * it when the walk reaches it. RECOMP_HLE_D3D8_LAZY_TEXTURES=0 binds at
+     * once, as before. */
+    if (!hle_d3d8_defer_recording() && stage < MAX_STAGES && lazy_textures_on()) {
+        if (texture && obj_field(texture, 16))
+            g_stage_size[stage] = obj_field(texture, 16);
+        g_pending_texture[stage] = texture;
+        g_pending_mask |= 1u << stage;
+        return;
+    }
+    /* Deferred (RECOMP_HLE_D3D8_DEFER), the host side runs when the frame is
+     * executed, so the texels are read then -- as the NV2A reads them when it
+     * reaches the draw, not when the title issued it. */
+    if (hle_d3d8_defer_recording()) {
+        uint32_t a[2];
+        a[0] = stage;
+        a[1] = texture;
+        hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+    } else {
+        shadow_set_texture(stage, texture);
+    }
+}
+
+/* void __fastcall D3DDevice_SwitchTexture(DWORD Method, DWORD Data,
+ *     DWORD Format) -- Xbox-only: change a stage's texture by writing its
+ * offset and format straight into the push buffer, with no texture object
+ * and no SetTexture. Need for Speed Underground 2's material code takes this
+ * path for most draws (0x000A87B3: Method 0x00081B00, the texture's own Data
+ * and Format); with only SetTexture seen, its font quads drew with the
+ * loading screen's picture and its buildings with the sky.
+ *
+ * The stage comes from the method (NV097_SET_TEXTURE_OFFSET is 0x1B00 + 64
+ * per stage). The texture is found among those already mirrored by its Data
+ * and Format, and bound through its object as SetTexture would. One no
+ * SetTexture has bound is mirrored from Data and Format alone (synth_key),
+ * which describe a swizzled or compressed texture completely: measured on
+ * NFSU2, 3.8M of 4.0M calls in a race run named such a texture. A linear one
+ * would need its object's Size, so it is counted and the stage left as it
+ * was. Cxbx-Reloaded replaces it too (EMUPATCH(D3DDevice_SwitchTexture)). */
+HLE_ORIGINAL(D3DDevice_SwitchTexture);
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format);
+
+HLE_EXPORT(D3DDevice_SwitchTexture)
+{
+    static int seen;
+    uint32_t method = g_ecx, data = g_edx, format = HLE_ARG(0);
+
+    if (!seen) {
+        seen = 1;
+        fprintf(stderr, "[HLE] D3DDevice_SwitchTexture(0x%X) replaced by name\n", g_ecx);
+    }
+    if (!hle_original_D3DDevice_SwitchTexture) {
+        fprintf(stderr, "[HLE] D3DDevice_SwitchTexture: original body missing -- regenerate the lift\n");
+        return;
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SwitchTexture);
+    if (hle_d3d8_shadow_device() && (method & 0x1FFCu) >= 0x1B00u && (method & 0x1FFCu) < 0x1C00u)
+        hle_d3d8_texture_by_state(((method & 0x1FFCu) - 0x1B00u) / 0x40u, data, format);
+}
+
+/* A stage's texture named by its offset and format alone, as SwitchTexture
+ * and the push buffer name it (SET_TEXTURE_OFFSET / SET_TEXTURE_FORMAT, 0x1B00
+ * and 0x1B04 + 64 per stage): found among the textures already mirrored by its
+ * Data and Format and bound through that object as SetTexture would. Halo 2's
+ * LTCG build writes those methods inline for every quad of its movie, flipping
+ * between two frame textures it bound once each through SetTexture. */
+void hle_d3d8_texture_by_state(uint32_t stage, uint32_t data, uint32_t format)
+{
+    {
+        uint32_t va = 0;
+        int i;
+
+        if (!hle_d3d8_shadow_device() || stage >= 4u)
+            return;
+        for (i = 0; i < g_texture_count; i++) {
+            texture_entry *c = &g_textures[i];
+            if (c->host && c->va && !is_synth(c->va) && c->data == data &&
+                c->format == format &&
+                HLE_MEM32(c->va + 4) == data && HLE_MEM32(c->va + 12) == format) {
+                va = c->va;
+                break;
+            }
+        }
+        /* A linear texture's size is not in its Format: the hardware keeps
+         * the stage's image rectangle and pitch from what it had bound, and
+         * only the offset changes. What decides how the memory is read is the
+         * pitch, so the texture the offset names is one over that memory with
+         * the stage's pitch, at its own size (a smaller target reads the same
+         * rows), or failing any, the stage's size itself. Rainbow Six 3's
+         * thermal and night vision copy the screen into a 640x480 surface and
+         * SwitchTexture its offset into a stage that had the 640x480 back
+         * buffer; a 320x240 texture over the same memory (another pitch) was
+         * taken instead, held last frame's blur, and the vision came out one
+         * flat colour. Its next pass switches to a 640x240 target with the
+         * same pitch, which must be read as itself. */
+        if (d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) && g_stage_size[stage]) {
+            uint32_t want = g_stage_size[stage], pitch = want >> 24;
+            uint32_t same = 0;
+
+            if (va && (HLE_MEM32(va + 16) >> 24) != pitch)
+                va = 0;
+            for (i = 0; !va && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->va && !is_synth(c->va) && c->data == data &&
+                    c->format == format && (c->size >> 24) == pitch &&
+                    HLE_MEM32(c->va + 4) == data && HLE_MEM32(c->va + 12) == format)
+                    va = c->va;
+            }
+            for (i = 0; !va && !same && i < g_texture_count; i++) {
+                texture_entry *c = &g_textures[i];
+                if (c->host && c->rendered && c->va == 0 && c->data == data &&
+                    (c->size >> 24) == pitch)
+                    same = c->size;
+            }
+            if (!va)
+                va = synth_key_sized(data, format, same ? same : want);
+        }
+        /* Not one SetTexture has bound: a swizzled or compressed texture is
+         * described completely by its Format, so it is mirrored from that. */
+        if (!va && !d3d8_format_is_linear((D3DFORMAT)((format >> 8) & 0xFFu)) &&
+            ((format >> 4) & 0xFu) == 2u && !(format & FORMAT_CUBEMAP))
+            va = synth_key(data, format);
+        if (!va) {
+            if (g_switch_misses++ < 3)
+                fprintf(stderr, "[HLE-D3D8] SwitchTexture stage %u: data 0x%08X format "
+                        "0x%08X matches no mirrored texture; the stage keeps what it had\n",
+                        stage, data, format);
+            return;
+        }
+        g_switch_hits++;
+        if (hle_d3d8_defer_recording()) {
+            uint32_t a[2];
+            a[0] = stage;
+            a[1] = va;
+            hle_d3d8_defer_op(op_set_texture, a, sizeof a);
+        } else {
+            shadow_set_texture(stage, va);
+        }
+    }
+}
+
+static void shadow_set_texture(uint32_t stage, uint32_t texture)
+{
+    {
+        IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+        IDirect3DTexture8 *host = NULL;
+
+        if (!dev || stage >= MAX_STAGES)
+            return;
+        if (texture && obj_field(texture, 16))
+            g_stage_size[stage] = obj_field(texture, 16);
+        if (texture) {
+            /* A cube the title rendered into is bound as itself, and one it
+             * filled from memory as a copy of those bytes (static_cube). */
+            static int static_cubes = -1;
+            IDirect3DCubeTexture8 *cube = is_synth(texture) ? NULL : bound_cube(texture);
+
+            if (static_cubes < 0)
+                static_cubes = xbox_EnvSwitch("RECOMP_HLE_D3D8_STATIC_CUBES", 1);
+            if (!cube && static_cubes && !is_synth(texture))
+                cube = static_cube(dev, texture);
+
+            if (cube) {
+                g_bound[stage] = NULL;
+                g_bound_entry[stage] = NULL;
+                g_cube_binds++;
+                host_SetTexture(dev, stage, (IDirect3DBaseTexture8 *)cube);
+                g_bound_count++;
+                report();
+                return;
+            }
+            host = host_texture(dev, texture);
+        }
+        hle_d3d8_note_stage_texels(stage, texture ? obj_field(texture, 4) & 0x0FFFFFFFu : 0u);
+        g_bound[stage] = host;
+        g_bound_entry[stage] = NULL;
+        {
+            int i;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host) {
+                    g_bound_entry[stage] = &g_textures[i];
+                    break;
+                }
+        }
+        if (stage == 0) {
+            /* Whether this draw is one of the title's full-screen passes over
+             * its own frame. Nothing else binds the frame buffer as stage 0,
+             * so it identifies them without matching a shader or a size. */
+            int i;
+            g_stage0_framebuffer = 0;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host && g_textures[i].framebuffer == FB_SCREEN) {
+                    g_stage0_framebuffer = 1;
+                    break;
+                }
+        }
+        /* The host pixel shader samples every stage whatever its operation
+         * (d3d8_shaders.c), and an unbound D3D11 slot reads as zero, so a
+         * stage with no host texture would turn the draw black once the
+         * title's own texture operations are forwarded. A texture the title
+         * bound but this file could not mirror gets opaque white instead.
+         *
+         * A stage the title left empty is passed on as empty. The host
+         * device then binds white itself, so a combiner reads what it read
+         * before, and its fixed-function path knows the stage has no texture
+         * and leaves it out where it reads one (d3d8_shaders.c). Passed as
+         * white, the stage overwrote everything before it: BLiNX's title
+         * movie came out white. */
+        host_SetTexture(dev, stage,
+                        (IDirect3DBaseTexture8 *)(host ? host : texture ? white_texture(dev)
+                                                                        : NULL));
+        g_bound_count++;
+        if (hle_d3d8_trace_on()) {
+            int fb = 0, i;
+            for (i = 0; host && i < g_texture_count; i++)
+                if (g_textures[i].host == host && g_textures[i].framebuffer)
+                    fb = 1;
+            fprintf(stderr, "[TRACE swap %lu] SetTexture stage %u <- 0x%08X common 0x%08X "
+                    "data 0x%08X format 0x%08X size 0x%08X -> %s\n",
+                    hle_d3d8_shadow_swaps(), stage, texture,
+                    texture ? obj_field(texture, 0) : 0, texture ? obj_field(texture, 4) : 0,
+                    texture ? obj_field(texture, 12) : 0, texture ? obj_field(texture, 16) : 0,
+                    !texture ? "none" : fb ? "frame buffer copy" : host ? "host texture" : "white");
+        }
+        report();
+    }
+}
+
+/* Does the draw about to be made sample the title's own frame at stage 0?
+ *
+ * That is what its full-screen passes do and what nothing else does, so it
+ * identifies them without having to match a shader hash or a vertex count.
+ * hle_d3d8.c uses it for RECOMP_HLE_D3D8_SKIP_FULLSCREEN. */
+int hle_d3d8_stage0_is_framebuffer(void)
+{
+    return g_stage0_framebuffer;
+}
+
+HLE_ORIGINAL(D3DDevice_SetPalette);
+
+/* void D3DDevice_SetPalette(DWORD Stage, X_D3DPalette *pPalette)
+ *
+ * The other half of P8. read_layout() now lets palettised textures through,
+ * and the host expands them to BGRA at upload through the palette belonging
+ * to the stage they are bound to (d3d8_convert_linear_pixels). That palette
+ * has to come from somewhere, and this is it.
+ *
+ * X_D3DPalette is an X_D3DResource -- Common, Data, Lock -- so the entries are
+ * at the physical address in Data, the same way a texture's texels are
+ * (Cxbx-Reloaded's CxbxImpl_SetPalette takes GetDataFromXboxResource(pPalette)
+ * and nothing else). 256 entries of ARGB8888, which is what the device keeps.
+ *
+ * Only remembered here. The hardware reads the palette at each draw, so
+ * sync_palette reads it there too and picks the host texture baked with it.
+ * A null palette means the device's grey ramp, not whatever was there last.
+ *
+ * The host's palettes go through host_SetPalette (host_stage_palette), so a
+ * capture records them (D3D8CAP_PALETTE, format 7) and a replayed frame
+ * expands its P8 textures through the palettes the title set.
+ */
+HLE_EXPORT(D3DDevice_SetPalette)
+{
+    static int seen;
+    uint32_t stage = HLE_ARG(0), palette_va = HLE_ARG(1);
+
+    if (!seen) {
+        seen = 1;
+        fprintf(stderr, "[HLE] D3DDevice_SetPalette(stage %u) replaced by name\n",
+                (unsigned)HLE_ARG(0));
+        fflush(stderr);
+    }
+    if (!hle_original_D3DDevice_SetPalette) {
+        fprintf(stderr, "[HLE] D3DDevice_SetPalette: original body missing -- "
+                        "regenerate the lift\n");
+        return;
+    }
+    HLE_CALL_ORIGINAL(D3DDevice_SetPalette);
+    {
+        IDirect3DDevice8 *dev = hle_d3d8_shadow_device();
+        uint32_t data;
+
+        if (!dev || stage >= 4u)
+            return;
+        if (!palette_va) {
+            set_pal_data(stage, 0);
+            return;
+        }
+        data = HLE_MEM32(palette_va + 4) & 0x0FFFFFFFu;
+        /* 256 entries of 4 bytes, and it has to be inside the window the
+         * texels live in or the pointer is not a palette. */
+        if (!data || (uint64_t)data + 1024u > CONTIG_SIZE) {
+            static int said;
+            if (!said++) {
+                fprintf(stderr, "[HLE-D3D8] SetPalette: stage %u palette data "
+                        "0x%08X is outside the contiguous window; ignored\n",
+                        (unsigned)stage, data);
+                fflush(stderr);
+            }
+            return;
+        }
+        set_pal_data(stage, data);
+    }
+}

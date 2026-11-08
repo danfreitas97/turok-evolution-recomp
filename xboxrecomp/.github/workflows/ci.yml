@@ -1,0 +1,357 @@
+# Build and test every pull request, and main after each merge.
+#
+# No game files are needed or used: the Python suite runs against synthetic
+# instructions and synthetic XBEs, the C build produces the runtime libraries,
+# and ctest runs small offline tests over them. Nothing here links a
+# recompiled title.
+#
+# Why it exists: the v0.9.0 upstream merge broke the MSVC build twice (a
+# dropped closing brace, and two bodies for one bridge function) and nothing
+# noticed, because no job compiled the C. The Linux and macOS jobs are what
+# prove the runtime stays free of Windows and Direct3D headers.
+#
+# An implicit function declaration is an error on every job: the root
+# CMakeLists says so, and the POSIX jobs pass it again in CFLAGS so that a
+# CMake edit cannot quietly turn it back into a warning. Three Win32 calls
+# with no POSIX shim (SetWaitableTimer and friends) once landed because the
+# POSIX build only warned about them.
+
+name: CI
+
+# A push to a branch with a pull request open used to run everything twice,
+# once for the push (refs/heads/...) and once for the pull request
+# (refs/pull/N/merge), which the concurrency group below saw as two refs. Now
+# a branch is checked through its pull request; main on its own pushes (the
+# merges); and a branch with no pull request yet through Run workflow.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per pull request (or per ref): a newer push cancels the last.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install pytest capstone
+
+      # tools/fusion needs pefile and MS Fusion inputs; it is optional tooling.
+      - name: Run tests
+        run: python -m pytest -q --ignore=tools/fusion
+
+  linux:
+    name: Build and test (Linux, GCC)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL3 for the host layer, and the Vulkan renderer's headers. The
+      # renderer finds the Vulkan loader and DXC at run time, so none of
+      # these is a link dependency.
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate
+
+      # As on macOS: DXC's headers only. Without them the renderer is built
+      # with no Vulkan backend and the DXC shader tests are left out.
+      - name: Fetch DXC headers
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
+          git -C "$RUNNER_TEMP/dxc" sparse-checkout set include/dxc
+          mkdir -p third_party/dxc/inc
+          cp "$RUNNER_TEMP"/dxc/include/dxc/*.h third_party/dxc/inc/
+
+      # SDL3 will not configure on Linux without a video backend (X11 or
+      # Wayland), so their development headers, and its audio backends'
+      # (PulseAudio, ALSA) for the SDL3 audio output. Headers only: nothing
+      # here opens a window or a device.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl-dev libdrm-dev libgbm-dev \
+            libpulse-dev libasound2-dev libudev-dev
+
+      - name: Configure
+        env:
+          CFLAGS: -Werror=implicit-function-declaration
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # Muted, and the tests that want a Vulkan device or an audio device
+      # report themselves skipped on a runner that has neither.
+      - name: Test
+        env:
+          RECOMP_MUTE: "1"
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    name: Build and test (macOS, Apple Silicon, clang)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # SDL3 for the host layer, and the Vulkan renderer's headers. The
+      # renderer finds the Vulkan loader and DXC at run time, so none of
+      # these is a link dependency.
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate
+
+      # DXC's headers (dxcapi.h and the WinAdapter.h it needs off Windows),
+      # without the rest of the repository. If this fails the renderer is
+      # built without its Vulkan backend, which still compiles and links.
+      - name: Fetch DXC headers
+        continue-on-error: true
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/microsoft/DirectXShaderCompiler.git "$RUNNER_TEMP/dxc"
+          git -C "$RUNNER_TEMP/dxc" sparse-checkout set include/dxc
+          mkdir -p third_party/dxc/inc
+          cp "$RUNNER_TEMP"/dxc/include/dxc/*.h third_party/dxc/inc/
+
+      - name: Install build dependencies
+        run: brew install ninja
+
+      - name: Configure
+        env:
+          CFLAGS: -Werror=implicit-function-declaration
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # No game data here, so no title is linked; the unit tests run muted
+      # (tests/audio_output forces RECOMP_MUTE and skips with no device),
+      # and the replay test skips without a Vulkan device. Nothing opens a
+      # window: tests/host_window is not a ctest.
+      - name: Test
+        env:
+          RECOMP_MUTE: "1"
+        run: ctest --test-dir build --output-on-failure
+
+  # The self-building release (docs/technical/self-build-release.md), made
+  # as a title's repository makes it on a tag: the pinned toolchain, the
+  # engine package, the builder and TimeSplitters 2's launcher. A check
+  # only: nothing is published, and no game is lifted or started.
+  release:
+    name: Self-building release (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate third_party/miniupnp
+          git submodule update --init --recursive --depth 1 third_party/XbSymbolDatabase
+
+      # The engine is compiled by the release's zig against its own glibc
+      # headers; these are what SDL loads at run time, searched after them.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxfixes-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libegl-dev libdrm-dev libgbm-dev \
+            libpulse-dev libasound2-dev libudev-dev \
+            libfreetype-dev libfontconfig-dev
+
+      # The whole of Microsoft's Linux release: the release carries its
+      # libdxcompiler.so.
+      - name: Fetch DXC
+        run: bash tools/linux/fetch_dxc.sh
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/downloads
+          key: release-downloads-${{ hashFiles('tools/release/fetch_toolchain.py') }}
+
+      # zig's own cache: the C runtimes, libc++ and compiler-rt it builds from
+      # source the first time it links for a target and a set of CPU features.
+      # On Windows that is MinGW's runtime, once for the compiler checks and
+      # again for each of SDL's SSE/AVX tests -- about 12 minutes of a cold
+      # run. Content-addressed by zig itself, so a kept entry is never stale;
+      # saved once per toolchain.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/work/zig-cache
+          key: release-zig-cache-linux-${{ hashFiles('tools/release/fetch_toolchain.py', 'tools/release/zigwrap.c') }}
+
+      - name: Builder tests
+        working-directory: tools/builder
+        run: cargo test --locked
+
+      - name: Make the TimeSplitters 2 release
+        run: |
+          python3 -m tools.release.make_release config/releases/timesplitters2.json \
+            --out "$RUNNER_TEMP/release/timesplitters2" --work "$RUNNER_TEMP/work" \
+            --cache "$RUNNER_TEMP/downloads" --version "ci-${GITHUB_SHA::7}" --archive
+          ls -l "$RUNNER_TEMP"/release/*.tar.xz
+
+  # The same on a Mac: the release is an application, and zig builds the
+  # player's game with no SDK, so only SDL and the launcher are built with
+  # Xcode here. The Vulkan loader, MoltenVK and DXC come from LunarG's SDK.
+  release-macos:
+    name: Self-building release (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate third_party/miniupnp
+          git submodule update --init --recursive --depth 1 third_party/XbSymbolDatabase
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vulkan-sdk-downloads
+          key: vulkan-sdk-${{ hashFiles('tools/macos/fetch_vulkan_sdk.sh') }}
+
+      - name: Fetch the Vulkan SDK
+        run: |
+          bash tools/macos/fetch_vulkan_sdk.sh "$RUNNER_TEMP/VulkanSDK" \
+            "$RUNNER_TEMP/vulkan-sdk-downloads" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/downloads
+          key: release-downloads-macos-${{ hashFiles('tools/release/fetch_toolchain.py') }}
+
+      # zig's own cache: the C runtimes, libc++ and compiler-rt it builds from
+      # source the first time it links for a target and a set of CPU features.
+      # On Windows that is MinGW's runtime, once for the compiler checks and
+      # again for each of SDL's SSE/AVX tests -- about 12 minutes of a cold
+      # run. Content-addressed by zig itself, so a kept entry is never stale;
+      # saved once per toolchain.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/work/zig-cache
+          key: release-zig-cache-macos-${{ hashFiles('tools/release/fetch_toolchain.py', 'tools/release/zigwrap.c') }}
+
+      - name: Builder tests
+        working-directory: tools/builder
+        run: cargo test --locked
+
+      - name: Make the TimeSplitters 2 release
+        run: |
+          python3 -m tools.release.make_release config/releases/timesplitters2.json \
+            --out "$RUNNER_TEMP/release/timesplitters2" --work "$RUNNER_TEMP/work" \
+            --cache "$RUNNER_TEMP/downloads" --version "ci-${GITHUB_SHA::7}" --archive
+          ls -l "$RUNNER_TEMP"/release/*.tar.xz
+
+  # And on Windows: zig builds everything for MinGW (the player needs no
+  # Visual Studio), against the UCRT and Direct3D 11 every Windows 10 has.
+  # The builder is the one thing built with Visual Studio here.
+  release-windows:
+    name: Self-building release (Windows)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch submodules
+        run: |
+          git submodule update --init --depth 1 \
+            third_party/SDL third_party/Vulkan-Headers \
+            third_party/volk third_party/VulkanMemoryAllocator \
+            third_party/libsamplerate third_party/miniupnp
+          git submodule update --init --recursive --depth 1 third_party/XbSymbolDatabase
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/downloads
+          key: release-downloads-windows-${{ hashFiles('tools/release/fetch_toolchain.py', 'tools/release/zigwrap.c') }}
+
+      # zig's own cache: the C runtimes, libc++ and compiler-rt it builds from
+      # source the first time it links for a target and a set of CPU features.
+      # On Windows that is MinGW's runtime, once for the compiler checks and
+      # again for each of SDL's SSE/AVX tests -- about 12 minutes of a cold
+      # run. Content-addressed by zig itself, so a kept entry is never stale;
+      # saved once per toolchain.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/work/zig-cache
+          key: release-zig-cache-windows-${{ hashFiles('tools/release/fetch_toolchain.py', 'tools/release/zigwrap.c') }}
+
+      # Defender scans every file the compilers write and every process they
+      # start, and a release build starts thousands. The runner is thrown
+      # away after the job.
+      - name: Turn off real-time scanning
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+
+      - name: Builder tests
+        working-directory: tools/builder
+        run: cargo test --locked
+
+      - name: Make the TimeSplitters 2 release
+        run: |
+          python -m tools.release.make_release config/releases/timesplitters2.json \
+            --out "$RUNNER_TEMP/release/timesplitters2" --work "$RUNNER_TEMP/work" \
+            --cache "$RUNNER_TEMP/downloads" --version "ci-${GITHUB_SHA::7}" --archive
+          ls -l "$RUNNER_TEMP"/release/*.zip
+
+      # Kept for a few days, to try on a Windows machine: it holds no game
+      # code, only the tools and TimeSplitters 2's project.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: timesplitters2-windows-x86_64
+          path: ${{ runner.temp }}/release/*.zip
+          retention-days: 3
+
+  windows:
+    name: Build and test (Windows, MSVC)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch SDL3
+        run: git submodule update --init --depth 1 third_party/SDL third_party/libsamplerate
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Debug --output-on-failure
