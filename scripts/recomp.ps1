@@ -8,7 +8,11 @@ if (-not (Test-Path (Join-Path $ToolkitDir "tools\abi_analysis\output\abi_functi
 New-Item -ItemType Directory -Force $GenDir | Out-Null
 Get-ChildItem $GenDir -File | Where-Object Name -ne ".gitkeep" | Remove-Item
 Push-Location $ToolkitDir
-try { Invoke-Py -m tools.recomp game_files/default.xbe --all --split $Split --gen-dir $GenDir } finally { Pop-Location }
+# --exclude-manual: src\recomp_manual.c is the one place the project changes
+# lifted functions -- a definition replaces the generated body, and a
+# sub_X_enter() hook runs at the top of it. The lifter reads it from there.
+$manual = Join-Path $RepoRoot "src\recomp_manual.c"
+try { Invoke-Py -m tools.recomp game_files/default.xbe --all --split $Split --gen-dir $GenDir --exclude-manual $manual } finally { Pop-Location }
 Write-Host ("Generated: " + (Get-ChildItem $GenDir -Filter *.c).Count + " C files, " +
     [math]::Round((Get-ChildItem $GenDir | Measure-Object Length -Sum).Sum/1MB) + " MB")
 Write-Host "Next: .\scripts\build.ps1"

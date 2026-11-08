@@ -84,7 +84,14 @@ scripts/               extract -> analyze -> recomp -> build -> run
       reports the 64 KB clusters the XBE's init flags ask for —
       [upstream PR #321](https://github.com/sp00nznet/xboxrecomp/pull/321); until it
       lands the submodule tracks `danfreitas97/xboxrecomp` branch `turok/v0.17`)
-- [ ] D3D init completes (currently goes quiet right after allocating the framebuffers)
+- [x] D3D init completes (D3D's GPU semaphore handed to the pushbuffer executor:
+      `sub_00198650_enter` in `src/recomp_manual.c`)
+- [x] DirectSound init (emulated APU answers the DSP mailbox)
+- [x] Loads its text and data from the `supertree*.tre` archives and starts the
+      intro movie (`data\video\intro.xmv`), ~35 s after launch
+- [ ] Intro movie visible: the title decodes it on the GPU (render-to-texture),
+      which the CPU rasteriser draws black
+- [ ] Render on the host GPU when there is one, CPU rasteriser as the fallback
 - [ ] First frame on screen
 - [ ] Menus, audio, input
 - [ ] In-game

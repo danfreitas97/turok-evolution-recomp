@@ -1,0 +1,6 @@
+[
+  {
+    "start": "0x001F3384",
+    "note": "XPP USB driver descriptor at 0x001F31E4: Init slot (+0x08); AddDevice/RemoveDevice (0x001F41B2, 0x001F4334) were already found. Reached only through the descriptor, so the detector missed it; the first call at boot failed to resolve."
+  }
+]

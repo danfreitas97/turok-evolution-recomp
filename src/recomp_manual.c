@@ -99,6 +99,56 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
     return (recomp_func_t)0;
 }
 
+/* ── XDK D3D: the GPU-progress semaphore ──────────────────────
+ *
+ * Turok links XDK 4627's Direct3D statically. Its fence wait, sub_00198650
+ * (D3D's BlockOnTime: time, flags), spins until the GPU has caught up with a
+ * point in the pushbuffer:
+ *
+ *     dev = *(0x001A1AD0);
+ *     while (dev->[0x30] - time >= dev->[0x30] - *dev->[0x34]) ;
+ *
+ * dev->[0x30] is the write sequence and dev->[0x34] points at the semaphore
+ * the GPU releases values into as it finishes work. (The toolkit's notes
+ * describe the same layout one word earlier, 0x2C/0x30, for a later XDK.)
+ * Nothing wrote that semaphore, so the first wait under D3D init spun for
+ * good with NV2A PUT == GET.
+ *
+ * With RECOMP_PB_EXEC the pushbuffer executor writes each
+ * BACK_END_WRITE_SEMAPHORE_RELEASE where it is told to. This tells it, the
+ * first time the wait runs and again if D3D moves the semaphore (device
+ * reset). D3D's ring-space checks read the same word, so they become honest
+ * too, without a hook of their own.
+ *
+ * An entry hook, not a replacement: the generated body still does D3D's own
+ * work (the kickoff of the release it waits for, the event wait path). */
+#define TUROK_D3D_DEVICE_PTR   0x001A1AD0u
+#define D3D_DEV_GPU_SEMAPHORE  0x34u
+
+extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+
+static uint32_t guest32(uint32_t va)
+{
+    return *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + va);
+}
+
+void sub_00198650_enter(void)
+{
+    static uint32_t s_semaphore;
+    uint32_t dev = guest32(TUROK_D3D_DEVICE_PTR);
+    uint32_t sem;
+
+    if (!dev)
+        return;
+    sem = guest32(dev + D3D_DEV_GPU_SEMAPHORE);
+    if (sem && sem != s_semaphore) {
+        s_semaphore = sem;
+        nv2a_pb_set_semaphore_target(sem);
+        fprintf(stderr, "[D3D] GPU semaphore at 0x%08X (device 0x%08X)\n", sem, dev);
+        fflush(stderr);
+    }
+}
+
 /* ── ICALL failure logging ─────────────────────────────────── */
 
 /*

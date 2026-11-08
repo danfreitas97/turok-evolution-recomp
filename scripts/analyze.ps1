@@ -11,7 +11,11 @@ try {
     Invoke-Py -m tools.xbe_parser game_files/default.xbe --json game_files/default_analysis.json
     # Every x86 section: the game's .text plus the statically linked XDK
     # libraries. DOLBY is DSP microcode, not x86, so it is left out.
-    Invoke-Py -m tools.disasm game_files/default.xbe --force --extra-sections D3D,D3DX,DSOUND,XPP,XGRPH,XMV
+    # config\seed_functions.json: entry points reached only through data
+    # (driver descriptors, callbacks) that the detector cannot see; each has
+    # a note saying where it was found.
+    $seeds = Join-Path $RepoRoot "config\seed_functions.json"
+    Invoke-Py -m tools.disasm game_files/default.xbe --force --extra-sections "D3D,D3DX,DSOUND,XPP,XGRPH,XMV" --seed-functions $seeds
     Invoke-Py -m tools.func_id game_files/default.xbe -v
     Invoke-Py -m tools.abi_analysis game_files/default.xbe -v
 } finally { Pop-Location }

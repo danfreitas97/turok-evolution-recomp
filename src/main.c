@@ -302,6 +302,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stderr, NULL, _IONBF, 0);
 
     printf("=== Turok: Evolution - Static Recompilation ===\n");
+
+    /* Defaults this title needs, before the runtime reads them. Each is only
+     * set when the user has not set it already.
+     *
+     * RECOMP_PB_EXEC: Turok links XDK D3D statically and writes NV2A methods
+     * straight into the pushbuffer. Without the executor nothing runs them,
+     * nothing releases D3D's GPU semaphore, and the first fence wait in D3D
+     * init never returns (see sub_00198650_enter in recomp_manual.c). */
+    if (!getenv("RECOMP_PB_EXEC"))
+        _putenv_s("RECOMP_PB_EXEC", "1");
+    /* RECOMP_AC97_READY: the emulated APU. DirectSound's effects-image
+     * download (Data\Sound\dsstdfx.bin) writes a command to the DSP's mailbox
+     * and spins until the DSP clears it (sub_001B1BEB, 0x001B1D52); without
+     * the APU nothing answers and boot stops there. */
+    if (!getenv("RECOMP_AC97_READY"))
+        _putenv_s("RECOMP_AC97_READY", "1");
+    /* RECOMP_FB_WINDOW: the window that shows the guest framebuffer. Without
+     * it the title runs with nothing on screen. */
+    if (!getenv("RECOMP_FB_WINDOW"))
+        _putenv_s("RECOMP_FB_WINDOW", "1");
     {
         const char *d = getenv("TUROK_GAME_DIR");
         snprintf(g_game_dir, sizeof g_game_dir, "%s",
