@@ -546,12 +546,11 @@ void sub_0009C9A0(void)
  * Nothing reads items 1..6 while playing: sub_00153A00, which sets up the
  * player, copies them once into the player (+0x3BC all weapons, +0x3B8
  * ammo) and into globals (0x2580DC invincible, 0x257FD0 invisible,
- * 0x257FE0 big heads). So a cheat chosen in the launcher is written into
- * Cheats.hst as the menu would have written it, on every screen change and
- * just before the player is set up, and the game does the rest. A cheat
- * left off in the launcher is left alone: words typed in the game still
- * work. A cheat the launcher switched on and the game's menu then switched
- * off stays off until the game is started again.
+ * 0x257FE0 big heads). A cheat chosen in the launcher is only unlocked:
+ * its item 15.. is set to 1, as its word would, on every screen change and
+ * just before the player is set up. The player switches it on and off in
+ * the game's Cheats menu, as on the console; the launcher never touches the
+ * switches. Level select has no switch: unlocked, the menu offers it.
  *
  * A history is a vector of 8-byte entries, { value, maximum }, items
  * counted from 1, under the history manager at [[0x257E14] + 0x80], whose
@@ -571,16 +570,15 @@ extern void sub_00153A00_gen(void);
 
 typedef struct {
     const char *env, *key;
-    int item;                   /* the switch, 0 for none */
     int unlock;                 /* the "shown in the menu" item */
 } TkCheat;
 
 static const TkCheat k_tk_cheats[] = {
-    { "TUROK_CHEAT_ALL_WEAPONS",    "cheat_all_weapons",    1, 15 },   /* texas */
-    { "TUROK_CHEAT_UNLIMITED_AMMO", "cheat_unlimited_ammo", 2, 16 },   /* madman */
-    { "TUROK_CHEAT_INVINCIBLE",     "cheat_invincible",     3, 17 },   /* emerpus */
-    { "TUROK_CHEAT_INVISIBLE",      "cheat_invisible",      4, 18 },   /* sllewgh */
-    { "TUROK_CHEAT_LEVEL_SELECT",   "cheat_level_select",   0, 19 },   /* sellout */
+    { "TUROK_CHEAT_ALL_WEAPONS",    "cheat_all_weapons",    15 },   /* texas */
+    { "TUROK_CHEAT_UNLIMITED_AMMO", "cheat_unlimited_ammo", 16 },   /* madman */
+    { "TUROK_CHEAT_INVINCIBLE",     "cheat_invincible",     17 },   /* emerpus */
+    { "TUROK_CHEAT_INVISIBLE",      "cheat_invisible",      18 },   /* sllewgh */
+    { "TUROK_CHEAT_LEVEL_SELECT",   "cheat_level_select",   19 },   /* sellout */
 };
 #define TK_CHEATS ((int)(sizeof k_tk_cheats / sizeof k_tk_cheats[0]))
 
@@ -626,16 +624,6 @@ static uint32_t tk_cheats_history(void)
     return 0;
 }
 
-/* Item `item` (from 1), or -1 if the history has no such item. */
-static int tk_history_get(uint32_t h, int item)
-{
-    uint32_t begin = tk_rd32(h + 4), end = tk_rd32(h + 8);
-
-    if (item < 1 || end < begin || (end - begin) / 8 < (uint32_t)item)
-        return -1;
-    return (int)tk_rd32(begin + (uint32_t)(item - 1) * 8);
-}
-
 /* Item `item` (from 1) to `value`, held to its maximum as sub_00060700 does. */
 static void tk_history_set(uint32_t h, int item, int value)
 {
@@ -652,7 +640,6 @@ static void tk_history_set(uint32_t h, int item, int value)
 static void tk_cheats_apply(void)
 {
     static int read, on[TK_CHEATS], any;
-    static int set[TK_CHEATS];          /* the switch was written on */
     static int reported;
     uint32_t h;
     int i;
@@ -670,20 +657,10 @@ static void tk_cheats_apply(void)
         if (!on[i])
             continue;
         tk_history_set(h, k_tk_cheats[i].unlock, 1);
-        if (!k_tk_cheats[i].item)
-            continue;
-        if (set[i] && tk_history_get(h, k_tk_cheats[i].item) == 0) {
-            on[i] = 0;                  /* switched off in the game's menu */
-            fprintf(stderr, "[TUROK] cheat %s switched off in the game\n",
-                    k_tk_cheats[i].key);
-            continue;
-        }
-        tk_history_set(h, k_tk_cheats[i].item, 1);
-        set[i] = 1;
     }
     if (!reported) {
         reported = 1;
-        fprintf(stderr, "[TUROK] cheats on:%s%s%s%s%s\n",
+        fprintf(stderr, "[TUROK] cheats unlocked:%s%s%s%s%s\n",
                 on[0] ? " all-weapons" : "", on[1] ? " unlimited-ammo" : "",
                 on[2] ? " invincible" : "", on[3] ? " invisible" : "",
                 on[4] ? " level-select" : "");

@@ -289,29 +289,32 @@ static void build_rows(void)
 
     g_video_count = (int)(r - g_video_rows);
 
-    /* The game's own cheats (the words its Cheats menu takes), switched on
-     * here for whoever wants them. Off leaves them to that menu. */
+    /* The game's own cheats (the words its Cheats menu takes), unlocked
+     * here for whoever wants them; that menu switches them on and off. */
     r = g_cheat_rows;
     r->label = "Invincible";
-    r->help  = "Enemies and falls cannot hurt you. The game's own cheat (emerpus).";
+    r->help  = "Enemies and falls cannot hurt you."
+               " Unlocked in the game's Cheats menu, where you switch it on and off.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_invincible;
     r++;
     r->label = "Unlimited ammo";
-    r->help  = "Weapons never run out. The game's own cheat (madman).";
+    r->help  = "Weapons never run out."
+               " Unlocked in the game's Cheats menu, where you switch it on and off.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_unlimited_ammo;
     r++;
     r->label = "All weapons";
-    r->help  = "Every weapon the level has, from the start of it. The game's own"
-               " cheat (texas).";
+    r->help  = "Every weapon the level has, from the start of it."
+               " Unlocked in the game's Cheats menu, where you switch it on and off.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_all_weapons;
     r++;
     r->label = "Invisible";
-    r->help  = "Enemies do not see you. The game's own cheat (sllewgh).";
+    r->help  = "Enemies do not see you."
+               " Unlocked in the game's Cheats menu, where you switch it on and off.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_invisible;
     r++;
     r->label = "Level select";
     r->help  = "Unlocks level select in the game's Cheats menu, to start any"
-               " level. The game's own cheat (sellout).";
+               " level.";
     r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_level_select;
     r++;
     g_cheat_count = (int)(r - g_cheat_rows);
