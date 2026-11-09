@@ -131,7 +131,8 @@ if(COMMAND recomp_add_launcher)
         BRAND_TITLE      "Turok Evolution Recomp"
         BRAND_FOOTER     "Fan project, not affiliated with Acclaim or the owners of Turok."
         BRAND_NEWS_TITLE "USA (NTSC) port in progress"
-        BRAND_NEWS_TEXT  "Built from your own disc on your own computer. Online play is in development.")
+        BRAND_NEWS_TEXT  "Built from your own disc on your own computer. Online play is in development."
+        BRAND_UPDATE_REPO danfreitas97/turok-evolution-recomp)
 endif()
 
 # Keep the same branded icon beside the executables for Windows shortcuts.

@@ -12,6 +12,8 @@
 #include <windows.h>
 #include <shobjidl.h>
 #include <shlobj.h>       /* SHGetKnownFolderPath: lhost_shortcut */
+#include <shellapi.h>     /* ShellExecuteW: lhost_open_url */
+#include <winhttp.h>      /* lhost_http_get */
 #include <objbase.h>
 
 #include <stdio.h>
@@ -392,6 +394,60 @@ int lhost_shortcut(const char *target, const char *dir, const char *icon,
     if (SUCCEEDED(init))
         CoUninitialize();
     return ok;
+}
+
+long lhost_http_get(const char *url, char *out, size_t n)
+{
+    WCHAR wurl[1024], host[256], path[1024];
+    URL_COMPONENTSW uc;
+    HINTERNET s = NULL, c = NULL, r = NULL;
+    long got = -1;
+    DWORD status = 0, len = sizeof status;
+
+    if (!url || !out || n < 2 || !MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 1024))
+        return -1;
+    memset(&uc, 0, sizeof uc);
+    uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path;  uc.dwUrlPathLength = 1024;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc))
+        return -1;
+    s = WinHttpOpen(L"TurokEvolutionRecomp-Launcher", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s)
+        return -1;
+    WinHttpSetTimeouts(s, 5000, 5000, 5000, 10000);
+    c = WinHttpConnect(s, host, uc.nPort, 0);
+    if (c)
+        r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                               WINHTTP_DEFAULT_ACCEPT_TYPES,
+                               uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (r && WinHttpSendRequest(r, L"Accept: application/vnd.github+json\r\n", (DWORD)-1L,
+                                WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(r, NULL) &&
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &len, WINHTTP_NO_HEADER_INDEX) &&
+        status == 200) {
+        DWORD read = 0;
+        size_t total = 0;
+
+        while (total + 1 < n && WinHttpReadData(r, out + total, (DWORD)(n - 1 - total), &read) && read)
+            total += read;
+        out[total] = 0;
+        got = (long)total;
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    WinHttpCloseHandle(s);
+    return got;
+}
+
+void lhost_open_url(const char *url)
+{
+    WCHAR w[1024];
+
+    if (url && MultiByteToWideChar(CP_UTF8, 0, url, -1, w, 1024))
+        ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL);
 }
 
 int lhost_pick(int folder)

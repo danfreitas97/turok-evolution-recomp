@@ -34,7 +34,8 @@
 #         BRAND_MOTES      5CFF8A        # the motes of light rising, RRGGBB
 #         BRAND_TITLE      "Turok Evolution Recompiled"     # the window title
 #         BRAND_FOOTER     "Fan project, not affiliated with ..."
-#         BRAND_NEWS_TITLE "..." BRAND_NEWS_TEXT "...")
+#         BRAND_NEWS_TITLE "..." BRAND_NEWS_TEXT "..."
+#         BRAND_UPDATE_REPO owner/repo)   # GitHub releases: newer ones are offered
 #
 # The pictures are compiled into the launcher, so a release carries them
 # without carrying files. With them the launcher opens on a front page
@@ -53,7 +54,7 @@ endfunction()
 
 function(recomp_add_launcher TARGET GAME_EXE)
     cmake_parse_arguments(_launcher "NO_WIDESCREEN"
-        "BRAND_BACKGROUND;BRAND_LOGO;BRAND_ACCENT;BRAND_MOTES;BRAND_TITLE;BRAND_FOOTER;BRAND_NEWS_TITLE;BRAND_NEWS_TEXT"
+        "BRAND_BACKGROUND;BRAND_LOGO;BRAND_ACCENT;BRAND_MOTES;BRAND_TITLE;BRAND_FOOTER;BRAND_NEWS_TITLE;BRAND_NEWS_TEXT;BRAND_UPDATE_REPO"
         "" ${ARGN})
     set(_dir ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
 
@@ -154,7 +155,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
     if(WIN32)
         # The rest is in every Windows.
         # ole32 for the open dialog a self-building release asks with.
-        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32 shell32 uuid)
+        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32 shell32 uuid winhttp)
     elseif(APPLE)
         target_link_libraries(${TARGET} PRIVATE SDL3::SDL3
             "-framework CoreText" "-framework CoreGraphics"
@@ -199,7 +200,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
                 "const unsigned char launcher_brand_logo[1] = {0};\n"
                 "const unsigned launcher_brand_logo_size = 0u;\n")
         endif()
-        foreach(_k TITLE FOOTER NEWS_TITLE NEWS_TEXT)
+        foreach(_k TITLE FOOTER NEWS_TITLE NEWS_TEXT UPDATE_REPO)
             string(TOLOWER "${_k}" _lk)
             string(REPLACE "\\" "\\\\" _v "${_launcher_BRAND_${_k}}")
             string(REPLACE "\"" "\\\"" _v "${_v}")

@@ -359,6 +359,43 @@ int lhost_shortcut(const char *target, const char *dir, const char *icon,
 #endif
 }
 
+/* curl, which every desktop Linux and macOS has, rather than a TLS stack in
+ * the launcher. The URL is ours (the title's release page), never typed. */
+long lhost_http_get(const char *url, char *out, size_t n)
+{
+    char cmd[1200];
+    FILE *p;
+    size_t total = 0, got;
+
+    if (!url || !out || n < 2 || strchr(url, '\'') || strlen(url) > 1000)
+        return -1;
+    snprintf(cmd, sizeof cmd,
+             "curl -fsSL --max-time 10 -H 'Accept: application/vnd.github+json' '%s' 2>/dev/null",
+             url);
+    p = popen(cmd, "r");
+    if (!p)
+        return -1;
+    while (total + 1 < n && (got = fread(out + total, 1, n - 1 - total, p)) > 0)
+        total += got;
+    out[total] = 0;
+    if (pclose(p) != 0)
+        return -1;
+    return (long)total;
+}
+
+void lhost_open_url(const char *url)
+{
+#if defined(__APPLE__)
+    char *argv[] = { "open", (char *)url, NULL };
+#else
+    char *argv[] = { "xdg-open", (char *)url, NULL };
+#endif
+    pid_t pid;
+
+    if (url)
+        posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+}
+
 int lhost_pick(int folder)
 {
     static const SDL_DialogFileFilter k_images[] = {

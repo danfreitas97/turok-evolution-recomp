@@ -2144,11 +2144,105 @@ extern const unsigned      launcher_brand_logo_size;
 extern const unsigned      launcher_brand_accent, launcher_brand_motes;   /* 0xRRGGBB */
 extern const char          launcher_brand_title[], launcher_brand_footer[];
 extern const char          launcher_brand_news_title[], launcher_brand_news_text[];
+extern const char          launcher_brand_update_repo[];
 #endif
 
 /* g_home is declared above nav(): the front page is up */
-static int g_home_sel;          /* 0 Play, 1 Settings, 2 Controls */
+static int g_home_sel;          /* 0 Play, 1 Settings, 2 Controls, 3 Update */
 #define HOME_ITEMS 3
+
+/* ---- a newer release
+ *
+ * The title's GitHub releases (BRAND_UPDATE_REPO), asked once in the
+ * background when the launcher opens. The installed version is the one the
+ * installer wrote into build.json beside the game; a build from source has
+ * none and is never told to update. Offered on the front page, as the last
+ * button: it opens the release's page, and the new installer, pointed at
+ * this folder, builds the game again with the saves kept. */
+static volatile long g_update_state;    /* 0 idle, 1 asking, 2 newer found, 3 none */
+static char g_update_current[96], g_update_tag[96], g_update_url[512];
+
+/* "v1.2.10" against "1.2.9": numbers compared in turn. A version that is not
+ * numbers (a test build) counts as older than any release. */
+static int version_newer(const char *tag, const char *have)
+{
+    const char *a = tag, *b = have;
+
+    if (*a == 'v' || *a == 'V') a++;
+    if (*b == 'v' || *b == 'V') b++;
+    if (*a < '0' || *a > '9')
+        return 0;
+    if (*b < '0' || *b > '9')
+        return 1;
+    while (*a || *b) {
+        long x = strtol(a, (char **)&a, 10), y = strtol(b, (char **)&b, 10);
+
+        if (x != y)
+            return x > y;
+        if (*a == '.') a++; else if (*a) break;
+        if (*b == '.') b++; else if (*b) break;
+    }
+    return 0;
+}
+
+static void update_thread(void)
+{
+    static char body[64 * 1024];
+    long state = 3;
+#ifdef LAUNCHER_HAS_BRAND
+    char url[300];
+
+    const char *repo = getenv("RECOMP_UPDATE_REPO");    /* for testing the offer */
+
+    if (!repo || !*repo)
+        repo = launcher_brand_update_repo;
+    snprintf(url, sizeof url, "https://api.github.com/repos/%s/releases/latest", repo);
+    if (lhost_http_get(url, body, sizeof body) > 0 &&
+        json_str(body, "tag_name", g_update_tag, sizeof g_update_tag) &&
+        json_str(body, "html_url", g_update_url, sizeof g_update_url) &&
+        version_newer(g_update_tag, g_update_current))
+        state = 2;
+#endif
+    lhost_publish(&g_update_state, state);
+}
+
+/* The installed version, and the question asked once. */
+static void update_check_start(void)
+{
+#ifdef LAUNCHER_HAS_BRAND
+    char self[LAUNCHER_PATH], path[LAUNCHER_PATH + 32], text[4096];
+    const char *p;
+    char *slash = NULL;
+
+    if ((!launcher_brand_update_repo[0] && !getenv("RECOMP_UPDATE_REPO")) ||
+        lhost_read(&g_update_state) != 0)
+        return;
+    if (g_release && g_release_version[0]) {
+        snprintf(g_update_current, sizeof g_update_current, "%s", g_release_version);
+    } else if (host_exe_path(self, sizeof self)) {
+        for (p = self; *p; p++)
+            if (*p == '/' || *p == '\\')
+                slash = (char *)p;
+        if (!slash)
+            return;
+        *slash = 0;
+        snprintf(path, sizeof path, "%s/build.json", self);
+        if (!read_small_file(path, text, sizeof text) ||
+            !json_str(text, "release_version", g_update_current, sizeof g_update_current))
+            return;                     /* built from source: nothing to compare */
+    } else {
+        return;
+    }
+    lhost_publish(&g_update_state, 1);
+    if (!lhost_thread(update_thread))
+        lhost_publish(&g_update_state, 3);
+#endif
+}
+
+static int update_offered(void)
+{
+    return lhost_read(&g_update_state) == 2;
+}
 
 static int home_left(void) { return g_cw * 46 / 100; }
 
@@ -2157,6 +2251,13 @@ static ThemeRect home_rect(int i)
     ThemeRect r;
     int w = home_left() - 96;
 
+    if (i == 3) {                       /* the update, in the NEWS card */
+        int left = home_left() + 12;
+
+        r.x = left + 20; r.w = 240; r.h = 40;
+        r.y = 232 + 198 - 14 - 40;
+        return r;
+    }
     r.x = 48; r.w = w; r.h = 68;
     r.y = g_ch - 236;
     if (i == 0)
@@ -2172,9 +2273,11 @@ static int home_hit(int mx, int my)
 {
     int i;
 
-    for (i = 0; i < HOME_ITEMS; i++) {
+    for (i = 0; i < HOME_ITEMS + 1; i++) {
         ThemeRect r = home_rect(i);
 
+        if (i == HOME_ITEMS && !update_offered())
+            break;
         if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
             return i;
     }
@@ -2185,6 +2288,11 @@ static void home_activate(int i)
 {
     if (i == 0) {
         do_play();
+        return;
+    }
+    if (i == 3) {
+        if (update_offered())
+            lhost_open_url(g_update_url);
         return;
     }
     g_home = 0;
@@ -2243,8 +2351,19 @@ static void draw_home(void)
              tr(g_settings.fullscreen ? "Fullscreen" : "In a window"));
     theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
 
-    /* What the title has to say. */
-    if (news_title[0] || news_text[0]) {
+    /* What the title has to say, or that a newer release is out. */
+    if (update_offered()) {
+        r.x = x; r.y = 232; r.w = w; r.h = 198;
+        c = theme_card(r, "NEWS");
+        r = c; r.h = 24;
+        snprintf(line, sizeof line, "Version %s is available", g_update_tag);
+        theme_text(r, line, 14, 700, THEME_TEXT, THEME_LEFT);
+        r = c; r.y += 32; r.h = 60;
+        theme_text_wrapped(r, "Download the new installer and choose this same folder: the "
+                              "game is built again and your saves and settings are kept.",
+                           11, THEME_TEXT_DIM);
+        theme_button(home_rect(3), "Download update", 1, g_home_sel == 3 ? 1.0 : 0.0);
+    } else if (news_title[0] || news_text[0]) {
         r.x = x; r.y = 232; r.w = w; r.h = 198;
         c = theme_card(r, "NEWS");
         r = c; r.h = 24;
@@ -2266,7 +2385,11 @@ static void draw_home(void)
 
 static void home_nav(int dx, int dy, int accept, int cancel)
 {
-    if (dy > 0 && g_home_sel == 0)
+    if (g_home_sel == 3 && (dx < 0 || dy))         /* off the update button */
+        g_home_sel = 0;
+    else if (dx > 0 && update_offered() && g_home_sel != 3)
+        g_home_sel = 3;                             /* to the right: the update */
+    else if (dy > 0 && g_home_sel == 0)
         g_home_sel = 1;
     else if (dy < 0 && g_home_sel != 0)
         g_home_sel = 0;
@@ -2637,6 +2760,7 @@ void launcher_init(void)
     /* RECOMP_LAUNCHER_BUILD=<image or folder>: build from it straight away,
      * for a front end that already knows where the disc is, and for a
      * script checking the whole path. */
+    update_check_start();               /* a newer release, in the background */
     build = getenv("RECOMP_LAUNCHER_BUILD");
     if (g_release && build && *build && g_rel == REL_SETUP) {
         snprintf(g_source, sizeof g_source, "%s", build);

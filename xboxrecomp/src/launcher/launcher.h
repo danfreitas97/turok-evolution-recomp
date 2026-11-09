@@ -105,5 +105,10 @@ int      lhost_pick(int folder);
  * a host without them (macOS: the app is its own). */
 int      lhost_shortcut(const char *target, const char *dir, const char *icon,
                         const char *name);
+/* GET an https URL into `out` (NUL-terminated, cut at n - 1). The bytes
+ * read, or -1. Blocking, for a thread of its own; gives up after ~10 s. */
+long     lhost_http_get(const char *url, char *out, size_t n);
+/* Open a web page in the desktop's browser. */
+void     lhost_open_url(const char *url);
 
 #endif /* XBOXRECOMP_LAUNCHER_H */

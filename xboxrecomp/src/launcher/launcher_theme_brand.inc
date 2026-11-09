@@ -334,7 +334,7 @@ void theme_button(ThemeRect r, const char *label, int primary, double lit)
     lit = clamp01(lit);
     if (primary) {
         fill_rrect(r, 8.0, AR, AG, AB, 1.0, 0.10 + 0.10 * lit, 0.35 + 0.65 * lit);
-        theme_text(r, label, 20, 700, RGB(0xFF, 0xF6, 0xF0), THEME_CENTRE);
+        theme_text(r, label, r.h >= 56 ? 20 : 13, 700, RGB(0xFF, 0xF6, 0xF0), THEME_CENTRE);
     } else {
         fill_rrect(r, 8.0, 0x16 + (int)(0x14 * lit), 0x14 + (int)(0x12 * lit),
                    0x14 + (int)(0x12 * lit), 0.88, 0.04, lit * 0.6);
