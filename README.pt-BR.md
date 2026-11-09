@@ -103,8 +103,15 @@ Na aba **Vídeo** do launcher:
 
 A aba **Cheats** do launcher liga os cheats do próprio jogo, os mesmos que o
 menu Cheats dele aceita como palavras: **Invencível**, **Munição infinita**,
-**Todas as armas**, **Invisível** e **Seleção de fase**. Um cheat desligado
-ali continua funcionando pelo menu do jogo, com a palavra dele.
+**Todas as armas**, **Invisível** e **Seleção de fase**. Eles valem a partir
+da próxima vez que o jogo abrir.
+
+O jogo também tem um menu de cheats próprio, onde cada cheat é liberado com a
+palavra dele e depois ligado ou desligado. O launcher só liga cheats: um
+desligado ali não é mexido, então a palavra digitada no jogo continua
+funcionando. Depois que um cheat esteve ligado, desligá-lo no launcher pode não
+bastar, porque o jogo pode mantê-lo ligado. Desligue-o no menu de cheats do
+jogo.
 
 ## Atualizar
 

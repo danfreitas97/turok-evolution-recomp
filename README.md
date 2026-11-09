@@ -100,8 +100,14 @@ In the launcher's **Video** tab:
 
 The launcher's **Cheats** tab switches on the game's own cheats, the same ones
 its Cheats menu takes as words: **Invincible**, **Unlimited ammo**, **All
-weapons**, **Invisible** and **Level select**. A cheat left off still works
-from the game's menu with its word.
+weapons**, **Invisible** and **Level select**. They take effect the next time
+the game starts.
+
+The game also has its own Cheats menu, where each cheat is unlocked with its
+word and then switched on or off. The launcher only switches cheats on: one
+left off there is not touched, so a word typed in the game still works. Once a
+cheat has been on, switching it off in the launcher may not be enough, because
+the game can keep it on. Switch it off in the game's Cheats menu.
 
 ## Updating
 
