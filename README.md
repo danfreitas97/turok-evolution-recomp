@@ -26,7 +26,8 @@ the toolkit but have not been tried with this port.
 
 - Turok: Evolution, USA (NTSC) release, as a disc image (`.iso` or `.xiso`).
   Other releases are refused (see [Releases of the game](#releases-of-the-game)).
-- 64-bit Windows 10 or 11.
+- 64-bit Windows 10 or 11. Linux (x86-64) and Mac (Apple Silicon) installers
+  exist too, but are experimental: they have not been tried with this port.
 - About 3 GB free in the folder you install to (the game's data is copied
   there).
 
@@ -35,12 +36,18 @@ game with.
 
 ## Install
 
-1. Start `turok.exe` from the installer.
-2. Choose the installation folder with **CHOOSE FOLDER...** (an empty one), and
+1. Download the installer from the [latest release](https://github.com/danfreitas97/turok-evolution-recomp/releases/latest), under
+   **Assets**: `turok-<version>-windows-x86_64.zip` for Windows (or
+   `turok-<version>-linux-x86_64.tar.xz`, `turok-<version>-macos-arm64.tar.xz`).
+   Unzip it anywhere, for example to your Downloads folder.
+2. Start `turok.exe` from the unzipped folder (Linux: `./turok`; Mac: see the
+   release notes for the one command to run first).
+3. Choose the installation folder with **CHOOSE FOLDER...** (an empty one), and
    your disc image with **SELECT ISO...**.
-3. Press **INSTALL**. The disc is checked, extracted and the game compiled,
+4. Press **INSTALL**. The disc is checked, extracted and the game compiled,
    with a progress bar and a live log. This takes a few minutes.
-4. When it finishes, a **Turok Evolution Recomp** shortcut is on your desktop.
+5. When it finishes, a **Turok Evolution Recomp** shortcut is on your desktop
+   (Windows and Linux). The unzipped installer can then be deleted.
 
 The installation folder holds everything: the game (`turok_recomp.exe`), the
 launcher (`turok.exe`), the disc's data (`game/`) and your settings and saves
@@ -110,7 +117,9 @@ left off there can still be unlocked in the game with its word.
 
 ## Updating
 
-Start the new installer and choose the same folder. It sees that the game was
+The launcher tells you when a new version is out: its NEWS card shows what
+it brings and a **Download update** button. Download the new installer as
+above, start it and choose the same folder. It sees that the game was
 built by an older release and builds it again; settings and saves are kept.
 
 ## Problems

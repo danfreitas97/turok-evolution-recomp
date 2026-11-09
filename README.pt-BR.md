@@ -26,7 +26,8 @@ existem no toolkit, mas não foram testados com este port.
 
 - Turok: Evolution, versão USA (NTSC), como imagem de disco (`.iso` ou
   `.xiso`). Outras versões são recusadas (veja [Versões do jogo](#versões-do-jogo)).
-- Windows 10 ou 11 de 64 bits.
+- Windows 10 ou 11 de 64 bits. Também há instaladores para Linux (x86-64) e Mac
+  (Apple Silicon), mas são experimentais: não foram testados com este port.
 - Cerca de 3 GB livres na pasta de instalação (os dados do jogo são copiados
   para lá).
 
@@ -35,13 +36,18 @@ compilar o jogo.
 
 ## Instalar
 
-1. Abra o `turok.exe` do instalador.
-2. Escolha a pasta de instalação em **ESCOLHER PASTA...** (uma pasta vazia) e a
+1. Baixe o instalador do [último release](https://github.com/danfreitas97/turok-evolution-recomp/releases/latest), em **Assets**:
+   `turok-<versão>-windows-x86_64.zip` para Windows (ou
+   `turok-<versão>-linux-x86_64.tar.xz`, `turok-<versão>-macos-arm64.tar.xz`).
+   Descompacte em qualquer lugar, por exemplo na pasta Downloads.
+2. Abra o `turok.exe` da pasta descompactada (Linux: `./turok`; Mac: veja nas
+   notas do release o comando para rodar antes).
+3. Escolha a pasta de instalação em **ESCOLHER PASTA...** (uma pasta vazia) e a
    sua imagem de disco em **SELECIONAR ISO...**.
-3. Clique em **INSTALAR**. O disco é conferido e extraído, e o jogo é
+4. Clique em **INSTALAR**. O disco é conferido e extraído, e o jogo é
    compilado, com barra de progresso e log ao vivo. Leva alguns minutos.
-4. No fim, aparece um atalho **Turok Evolution Recomp** na sua área de
-   trabalho.
+5. No fim, aparece um atalho **Turok Evolution Recomp** na sua área de
+   trabalho (Windows e Linux). A pasta do instalador pode ser apagada depois.
 
 A pasta de instalação guarda tudo: o jogo (`turok_recomp.exe`), o launcher
 (`turok.exe`), os dados do disco (`game/`) e as suas configurações e saves
@@ -113,7 +119,9 @@ desligado ali ainda pode ser liberado no jogo com a palavra dele.
 
 ## Atualizar
 
-Abra o instalador novo e escolha a mesma pasta. Ele percebe que o jogo foi
+O launcher avisa quando sai uma versão nova: o card NOVIDADES mostra o que ela
+traz e um botão **Baixar atualização**. Baixe o instalador novo como acima,
+abra-o e escolha a mesma pasta. Ele percebe que o jogo foi
 compilado por um release antigo e compila de novo; configurações e saves são
 mantidos.
 
