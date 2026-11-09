@@ -1646,6 +1646,14 @@ void xbox_HostExit(const char *why)
         extern void recomp_profile_dump(void);
         recomp_profile_dump();
     }
+#ifdef _WIN32
+    /* Not ExitProcess: that runs every DLL's detach, and a game thread
+     * holding a lock one of them needs (the audio engine, the display
+     * driver) leaves the window open and the process hung. Everything worth
+     * keeping is already written: saves go straight to their files. */
+    fflush(NULL);
+    TerminateProcess(GetCurrentProcess(), 0);
+#endif
     ExitProcess(0);
 }
 

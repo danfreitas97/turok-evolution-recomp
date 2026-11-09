@@ -128,7 +128,7 @@ if(COMMAND recomp_add_launcher)
         BRAND_LOGO       assets/launcher/logo.png
         BRAND_ACCENT     2E9B45
         BRAND_MOTES      4DFF7C
-        BRAND_TITLE      "Turok Evolution Recompiled"
+        BRAND_TITLE      "Turok Evolution Recomp"
         BRAND_FOOTER     "Fan project, not affiliated with Acclaim or the owners of Turok."
         BRAND_NEWS_TITLE "USA (NTSC) port in progress"
         BRAND_NEWS_TEXT  "Built from your own disc on your own computer. Online play is in development.")

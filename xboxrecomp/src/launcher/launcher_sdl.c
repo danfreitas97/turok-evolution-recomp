@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/stat.h>     /* mkdir, chmod: lhost_shortcut */
 
 #include "launcher.h"
 #include "launcher_theme.h"
@@ -298,6 +299,64 @@ static void SDLCALL pick_done(void *userdata, const char *const *files, int filt
     if (g_pick_ok)
         snprintf(g_pick_path, sizeof g_pick_path, "%s", files[0]);
     SDL_SetAtomicInt(&g_pick_state, 2);
+}
+
+/* Linux: a desktop entry in the applications menu, and on the desktop when
+ * the desktop folder exists. macOS: the app bundle is the shortcut. */
+int lhost_shortcut(const char *target, const char *dir, const char *icon,
+                   const char *name)
+{
+#if defined(__APPLE__)
+    (void)target; (void)dir; (void)icon; (void)name;
+    return 0;
+#else
+    const char *home = getenv("HOME"), *data = getenv("XDG_DATA_HOME");
+    char path[4096], file[64], *c;
+    const char *places[2];
+    char apps[4096], desk[4096];
+    int i, made = 0;
+
+    if (!target || !name || !home)
+        return 0;
+    snprintf(file, sizeof file, "%s", name);
+    for (c = file; *c; c++)                 /* a file name: no spaces or slashes */
+        if (*c == ' ' || *c == '/' || *c == ':')
+            *c = '-';
+    if (data && *data)
+        snprintf(apps, sizeof apps, "%s/applications", data);
+    else
+        snprintf(apps, sizeof apps, "%s/.local/share/applications", home);
+    snprintf(desk, sizeof desk, "%s/Desktop", home);
+    places[0] = apps;
+    places[1] = desk;
+    for (i = 0; i < 2; i++) {
+        FILE *f;
+
+        if (i == 0) {
+            char mk[4200];
+            snprintf(mk, sizeof mk, "%s", apps);
+            for (c = mk + 1; *c; c++)
+                if (*c == '/') { *c = 0; mkdir(mk, 0755); *c = '/'; }
+            mkdir(mk, 0755);
+        } else if (access(desk, F_OK) != 0) {
+            continue;
+        }
+        snprintf(path, sizeof path, "%s/%s.desktop", places[i], file);
+        f = fopen(path, "w");
+        if (!f)
+            continue;
+        fprintf(f, "[Desktop Entry]\nType=Application\nName=%s\nExec=\"%s\"\n", name, target);
+        if (dir && *dir)
+            fprintf(f, "Path=%s\n", dir);
+        if (icon && *icon)
+            fprintf(f, "Icon=%s\n", icon);
+        fprintf(f, "Terminal=false\nCategories=Game;\n");
+        fclose(f);
+        chmod(path, 0755);
+        made = 1;
+    }
+    return made;
+#endif
 }
 
 int lhost_pick(int folder)

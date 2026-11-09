@@ -70,6 +70,8 @@ struct Release {
     /// The executable the recipe's CMakeLists builds (its target name).
     exe: String,
     #[serde(default)]
+    launcher: Option<String>,
+    #[serde(default)]
     images: Vec<Image>,
     /// The images as SHA-1s alone (releases made before images had names).
     #[serde(default)]
@@ -371,29 +373,27 @@ fn extract_iso(iso: &Path, out: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// A folder of links to the player's own copy: folders as symlinks, files as
-/// hard links where the file system allows, symlinks where it does not. The
-/// game's save folders are left out, so it writes into real, empty ones here
-/// (E: is the game folder) and never into the player's copy.
-fn mirror_folder(src: &Path, out: &Path) -> Result<(), Failure> {
+/// Copy the disc files so an installed game never depends on its source folder.
+/// Save folders belong to the installation and are preserved separately.
+fn copy_game_folder(src: &Path, out: &Path) -> Result<(), Failure> {
     fs::create_dir_all(out).or_else(|e| fail(format!("cannot create {}: {e}", out.display())))?;
-    let entries = fs::read_dir(src)
-        .or_else(|e| fail(format!("cannot read {}: {e}", src.display())))?;
-    for entry in entries.flatten() {
+    for entry in fs::read_dir(src).or_else(|e| fail(format!("cannot read {}: {e}", src.display())))? {
+        let entry = entry.or_else(|e| fail(format!("cannot read directory entry: {e}")))?;
         let name = entry.file_name();
-        let upper = name.to_string_lossy().to_uppercase();
-        if upper == "UDATA" || upper == "TDATA" {
+        if matches!(name.to_string_lossy().to_uppercase().as_str(), "UDATA" | "TDATA") {
             continue;
         }
-        let from = fs::canonicalize(entry.path()).map(plain)
-            .or_else(|e| fail(format!("cannot resolve {}: {e}", entry.path().display())))?;
-        let to = out.join(&name);
-        let linked = if from.is_dir() {
-            symlink_dir(&from, &to)
+        let from = entry.path();
+        let to = out.join(name);
+        let kind = entry.file_type().or_else(|e| fail(format!("cannot inspect {}: {e}", from.display())))?;
+        if kind.is_symlink() {
+            return fail(format!("{} is a link; choose an ISO or a folder with real game files", from.display()));
+        }
+        if kind.is_dir() {
+            copy_game_folder(&from, &to)?;
         } else {
-            fs::hard_link(&from, &to).or_else(|_| symlink_file(&from, &to))
-        };
-        linked.or_else(|e| fail(format!("cannot link {}: {e}", to.display())))?;
+            fs::copy(&from, &to).or_else(|e| fail(format!("cannot copy {}: {e}", from.display())))?;
+        }
     }
     Ok(())
 }
@@ -403,24 +403,16 @@ fn symlink_dir(from: &Path, to: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(from, to)
 }
 #[cfg(unix)]
-fn symlink_file(from: &Path, to: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(from, to)
-}
-#[cfg(unix)]
 fn is_dir_link(_m: &fs::Metadata) -> bool {
     false
 }
 
 /// On Windows a folder is linked with a junction, which needs no privilege
-/// (a symbolic link needs Developer Mode or an administrator); a file that
-/// cannot be hard-linked (another drive) is copied.
+/// (a symbolic link needs Developer Mode or an administrator). Only the
+/// temporary build project links to the toolkit; installed game data is copied.
 #[cfg(windows)]
 fn symlink_dir(from: &Path, to: &Path) -> io::Result<()> {
     junction::create(from, to)
-}
-#[cfg(windows)]
-fn symlink_file(from: &Path, to: &Path) -> io::Result<()> {
-    fs::copy(from, to).map(|_| ())
 }
 #[cfg(windows)]
 fn is_dir_link(m: &fs::Metadata) -> bool {
@@ -616,7 +608,7 @@ fn prepare_game(source: &Path, user: &Path) -> Result<(), Failure> {
         progress("game", 0, 1, "");
         let partial = user.join("game.partial");
         remove_owned(&partial)?;
-        mirror_folder(source, &partial)?;
+        copy_game_folder(source, &partial)?;
         carry_saves(&game, &partial)?;
         remove_owned(&game)?;
         fs::rename(&partial, &game)
@@ -952,15 +944,35 @@ fn install(release: &Release, user: &Path, built: &Path, sha1: &str) -> Result<P
     if dxc.is_file() {
         let link = user.join("libdxcompiler.so");
         let _ = fs::remove_file(&link);
-        symlink_file(&dxc, &link).or_else(|e| fail(format!("cannot link the shader compiler: {e}")))?;
+        fs::copy(&dxc, &link).or_else(|e| fail(format!("cannot copy the shader compiler: {e}")))?;
     }
+    // The installed launcher works beside the compiled game without release tools.
+    if let Some(name) = &release.launcher {
+        if Path::new(name).file_name().and_then(|v| v.to_str()) != Some(name.as_str()) {
+            return fail("invalid launcher file name in release.json");
+        }
+        let source = release.dir.join(name);
+        #[cfg(target_os = "macos")]
+        let source = release.dir.parent().unwrap().join("MacOS").join(name);
+        fs::copy(&source, user.join(name))
+            .or_else(|e| fail(format!("cannot install launcher: {e}")))?;
+    }
+    for name in ["icon.ico", "icon.png", "LICENSE", "NOTICE.txt"] {
+        let source = release.dir.join(name);
+        if source.is_file() {
+            fs::copy(&source, user.join(name))
+                .or_else(|e| fail(format!("cannot install {name}: {e}")))?;
+        }
+    }
+    fs::create_dir_all(user.join("user"))
+        .and_then(|_| fs::write(user.join(".turok-portable"), "1\n"))
+        .or_else(|e| fail(format!("cannot enable portable installation: {e}")))?;
     write_json(&user.join("build.json"), &Stamp {
         release_version: release.version.clone(),
         title_id: release.title_id.clone(),
         xbe_sha1: sha1.to_string(),
-        exe: dest.display().to_string(),
+        exe: exe_name(&release.exe),
     })?;
-    progress("install", 1, 1, "");
     Ok(dest)
 }
 
@@ -1097,6 +1109,12 @@ fn cmd_build(release: &Release, source: Option<PathBuf>, install_dir: Option<Pat
     lift(release, &image, &user, &log)?;
     let built = build(release, &user, &log)?;
     let exe = install(release, &user, &built, &image.sha1)?;
+    // Only installer-owned build folders are disposable; keep game, user and logs.
+    progress("install", 0, 1, "Removing temporary build files");
+    for name in ["project", "pipe", "build", "zig-cache", "tmp"] {
+        remove_owned(&user.join(name))?;
+    }
+    progress("install", 1, 1, "");
     remember_install(&release.title_id, &user)?;
     emit(json!({"event": "done", "exe": exe, "game_dir": user.join("game")}));
     Ok(())
@@ -1155,7 +1173,7 @@ fn cmd_relink(release: &Release, source: Option<PathBuf>) -> Result<(), Failure>
         let _ = fs::remove_file(user.join("build.json"));
         return Err(different(&sha1));
     }
-    emit(json!({"event": "done", "exe": stamp.exe, "game_dir": user.join("game")}));
+    emit(json!({"event": "done", "exe": user.join(exe_name(&release.exe)), "game_dir": user.join("game")}));
     Ok(())
 }
 
@@ -1165,9 +1183,9 @@ fn cmd_status(release: &Release) -> Result<(), Failure> {
     let stamp: Option<Stamp> = read_json(&user.join("build.json"));
     let state = match &stamp {
         Some(s) if s.release_version == release.version
-            && Path::new(&s.exe).is_file() && !game_intact(&user) => "moved",
+            && user.join(exe_name(&release.exe)).is_file() && !game_intact(&user) => "moved",
         Some(s) if s.release_version == release.version
-            && Path::new(&s.exe).is_file() => "ready",
+            && user.join(exe_name(&release.exe)).is_file() => "ready",
         Some(_) => "stale",
         None if source.is_some() => "unbuilt",
         None => "no-source",
@@ -1176,7 +1194,7 @@ fn cmd_status(release: &Release) -> Result<(), Failure> {
         "event": "status", "state": state, "user_dir": user,
         "source": source.map(|s| s.path),
         "built_version": stamp.as_ref().map(|s| s.release_version.clone()),
-        "exe": stamp.map(|s| s.exe),
+        "exe": stamp.map(|_| user.join(exe_name(&release.exe))),
     }));
     Ok(())
 }
@@ -1271,25 +1289,65 @@ mod tests {
     }
 
     #[test]
-    fn a_mirror_links_the_game_and_leaves_its_saves_out() {
+    fn installation_carries_launcher_binary_and_portable_data_after_move() {
+        let d = scratch("portable-install");
+        let release_dir = d.join("release");
+        let user = d.join("installed");
+        fs::create_dir_all(&release_dir).unwrap();
+        fs::create_dir_all(user.join("game/Data")).unwrap();
+        fs::write(user.join("game/default.xbe"), b"xbe").unwrap();
+        fs::write(user.join("game/Data/movie.xmv"), b"movie").unwrap();
+        let launcher = exe_name("turok");
+        let mut release: Release = serde_json::from_value(json!({
+            "title_id":"41430004", "title_name":"Turok", "version":"test",
+            "exe":"turok_recomp", "launcher":launcher, "images":[]
+        })).unwrap();
+        release.dir = release_dir.clone();
+        #[cfg(target_os = "macos")]
+        fs::create_dir_all(d.join("MacOS")).unwrap();
+        #[cfg(target_os = "macos")]
+        fs::write(d.join("MacOS").join(&launcher), b"launcher").unwrap();
+        fs::write(release_dir.join(&launcher), b"launcher").unwrap();
+        fs::write(release_dir.join("icon.ico"), b"icon").unwrap();
+        let built = d.join("compiled");
+        fs::write(&built, b"compiled executable").unwrap();
+        install(&release, &user, &built, "test-sha").unwrap();
+        fs::write(user.join("user/save"), b"progress").unwrap();
+        let moved = d.join("Moved installation");
+        fs::rename(&user, &moved).unwrap();
+        fs::remove_dir_all(&release_dir).unwrap();
+        fs::remove_file(&built).unwrap();
+        assert_eq!(fs::read(moved.join(exe_name("turok_recomp"))).unwrap(), b"compiled executable");
+        assert_eq!(fs::read(moved.join(launcher)).unwrap(), b"launcher");
+        assert_eq!(fs::read(moved.join("game/Data/movie.xmv")).unwrap(), b"movie");
+        assert_eq!(fs::read(moved.join("user/save")).unwrap(), b"progress");
+        assert!(moved.join(".turok-portable").is_file());
+        let stamp: Stamp = read_json(&moved.join("build.json")).unwrap();
+        assert_eq!(stamp.exe, exe_name("turok_recomp"));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_copy_contains_real_files_and_leaves_source_saves_out() {
         let d = scratch("mirror");
         let (src, out) = (d.join("src"), d.join("out"));
         for sub in ["Data", "UDATA", "tdata"] {
             fs::create_dir_all(src.join(sub)).unwrap();
         }
         fs::write(src.join("default.xbe"), b"xbe").unwrap();
-        mirror_folder(&src, &out).unwrap();
-        assert!(fs::symlink_metadata(out.join("Data")).unwrap().file_type().is_symlink());
+        copy_game_folder(&src, &out).unwrap();
+        assert!(!fs::symlink_metadata(out.join("Data")).unwrap().file_type().is_symlink());
+        fs::write(src.join("default.xbe"), b"changed").unwrap();
         assert_eq!(fs::read(out.join("default.xbe")).unwrap(), b"xbe");
         assert!(!out.join("UDATA").exists() && !out.join("tdata").exists());
-        // Removing the mirror removes links, never what they point at.
+        // Removing the installed copy leaves the source untouched.
         remove_owned(&out).unwrap();
         assert!(src.join("Data").is_dir() && src.join("default.xbe").is_file());
         let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn a_moved_folder_is_seen_and_relinked() {
+    fn moving_the_source_does_not_break_the_installed_copy() {
         let d = scratch("moved");
         let (src, user) = (d.join("src"), d.join("user"));
         fs::create_dir_all(src.join("Data")).unwrap();
@@ -1298,10 +1356,10 @@ mod tests {
         fs::create_dir_all(user.join("game").join("UDATA")).unwrap();
         fs::write(user.join("game").join("UDATA").join("save"), b"s").unwrap();
         assert!(game_intact(&user));
-        // The player moves their folder: the folder links dangle.
+        // The player moves their source: the installed copy remains independent.
         let moved = d.join("moved");
         fs::rename(&src, &moved).unwrap();
-        assert!(!game_intact(&user), "a dangling link is a broken game");
+        assert!(game_intact(&user), "the installed game must not depend on the source path");
         prepare_game(&moved, &user).unwrap();
         assert!(game_intact(&user));
         assert_eq!(fs::read(user.join("game").join("UDATA").join("save")).unwrap(), b"s",
@@ -1377,7 +1435,7 @@ mod tests {
         fs::create_dir_all(src.join("UDATA")).unwrap();
         fs::write(src.join("UDATA/disc.txt"), b"disc").unwrap();
         let other = d.join("game.new");
-        mirror_folder(&src, &other).unwrap();
+        copy_game_folder(&src, &other).unwrap();
         fs::create_dir_all(other.join("UDATA")).unwrap();      // as an image would
         carry_saves(&d.join("game"), &other).unwrap();
         assert!(other.join("UDATA/4553000A/save.dat").is_file());

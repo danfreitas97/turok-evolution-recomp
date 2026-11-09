@@ -53,6 +53,8 @@
 #include <xbox/xboxrecomp.h>
 #include "xbox_watchpoint.h"
 #include "xbox_fault_route.h"
+/* recomp_config.h: a portable installation keeps its settings beside the game. */
+void recomp_portable_init(const char *executable);
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -437,6 +439,11 @@ static int title_main(int argc, char **argv)
 
     /* Before anything prints: a windowed program has nowhere to print
      * unless this says where. */
+    {
+        char executable[MAX_PATH];
+        if (host_exe_path(executable, sizeof executable))
+            recomp_portable_init(executable);
+    }
     host_setup_output(g_log_path, sizeof g_log_path);
 
     /* Unbuffered CRT output can stall the render thread in tiny WriteFile

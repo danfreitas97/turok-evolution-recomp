@@ -154,7 +154,7 @@ function(recomp_add_launcher TARGET GAME_EXE)
     if(WIN32)
         # The rest is in every Windows.
         # ole32 for the open dialog a self-building release asks with.
-        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32)
+        target_link_libraries(${TARGET} PRIVATE user32 gdi32 ole32 shell32 uuid)
     elseif(APPLE)
         target_link_libraries(${TARGET} PRIVATE SDL3::SDL3
             "-framework CoreText" "-framework CoreGraphics"

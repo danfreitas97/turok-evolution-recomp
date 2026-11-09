@@ -11,6 +11,8 @@
 #define COBJMACROS
 #include <windows.h>
 #include <shobjidl.h>
+#include <shlobj.h>       /* SHGetKnownFolderPath: lhost_shortcut */
+#include <objbase.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -343,6 +345,54 @@ static const CLSID k_clsid_file_open = {0xdc1c5a9c, 0xe88a, 0x4dde,
                                         {0xa5, 0xa1, 0x60, 0xf8, 0x2a, 0x20, 0xae, 0xf7}};
 static const IID k_iid_file_open = {0xd57c7288, 0xd4ad, 0x4768,
                                     {0xbe, 0x02, 0x9d, 0x96, 0x95, 0x32, 0xd9, 0x60}};
+
+/* The desktop shortcut an installation leaves behind (IShellLink, saved
+ * through IPersistFile as <Desktop>\<name>.lnk). */
+int lhost_shortcut(const char *target, const char *dir, const char *icon,
+                   const char *name)
+{
+    WCHAR wtarget[MAX_PATH], wdir[MAX_PATH], wicon[MAX_PATH], wname[260], path[MAX_PATH];
+    PWSTR desktop = NULL;
+    IShellLinkW *link = NULL;
+    IPersistFile *file = NULL;
+    HRESULT init, hr;
+    int ok = 0;
+
+    if (!target || !name ||
+        !MultiByteToWideChar(CP_UTF8, 0, target, -1, wtarget, MAX_PATH) ||
+        !MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, 260))
+        return 0;
+    if (!dir || !MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, MAX_PATH))
+        wdir[0] = 0;
+    if (!icon || !MultiByteToWideChar(CP_UTF8, 0, icon, -1, wicon, MAX_PATH))
+        wicon[0] = 0;
+    if (FAILED(SHGetKnownFolderPath(&FOLDERID_Desktop, 0, NULL, &desktop)))
+        return 0;
+    _snwprintf(path, MAX_PATH, L"%s\\%s.lnk", desktop, wname);
+    path[MAX_PATH - 1] = 0;
+    CoTaskMemFree(desktop);
+
+    init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IShellLinkW, (void **)&link);
+    if (SUCCEEDED(hr)) {
+        link->lpVtbl->SetPath(link, wtarget);
+        if (wdir[0])
+            link->lpVtbl->SetWorkingDirectory(link, wdir);
+        if (wicon[0])
+            link->lpVtbl->SetIconLocation(link, wicon, 0);
+        link->lpVtbl->SetDescription(link, wname);
+        hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&file);
+        if (SUCCEEDED(hr)) {
+            ok = SUCCEEDED(file->lpVtbl->Save(file, path, TRUE));
+            file->lpVtbl->Release(file);
+        }
+        link->lpVtbl->Release(link);
+    }
+    if (SUCCEEDED(init))
+        CoUninitialize();
+    return ok;
+}
 
 int lhost_pick(int folder)
 {

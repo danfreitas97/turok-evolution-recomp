@@ -165,12 +165,35 @@ static int dir_from(char *out, size_t n, const char *var, const char *home_rel)
  * does not fit. The last must not fall through to the player's directory --
  * that is the one thing the switch exists to prevent -- so the helpers
  * report no directory at all instead. */
+static char portable_user_dir[1024];
+
+void recomp_portable_init(const char *executable)
+{
+    char marker[1024], *slash, *back;
+    FILE *file;
+    portable_user_dir[0] = 0;
+    if (!executable || strlen(executable) >= sizeof marker) return;
+    strcpy(marker, executable);
+    slash = strrchr(marker, '/');
+    back = strrchr(marker, '\\');
+    if (!slash || (back && back > slash)) slash = back;
+    if (!slash) return;
+    *slash = 0;
+    if (strlen(marker) + sizeof "/.turok-portable" > sizeof marker) return;
+    strcat(marker, "/.turok-portable");
+    file = fopen(marker, "rb");
+    if (!file) return;
+    fclose(file);
+    *slash = 0;
+    snprintf(portable_user_dir, sizeof portable_user_dir, "%s/user", marker);
+}
+
 static int override_dir(char *out, size_t n, const char *tail)
 {
     const char *v = getenv("RECOMP_USER_DIR");
     int len;
-    if (!v || !*v)
-        return 0;
+    if (!v || !*v) v = portable_user_dir;
+    if (!*v) return 0;
     len = snprintf(out, n, "%s%s", v, tail);
     if (len > 0 && (size_t)len < n)
         return 1;
@@ -405,6 +428,16 @@ int recomp_settings_read(const char *path, RecompSettings *s)
             snprintf(s->syslink_code, sizeof s->syslink_code, "%s", v);
         if ((v = from_table("syslink_upnp")) != NULL)
             s->syslink_upnp = !off_word(v);
+        if ((v = from_table("cheat_invincible")) != NULL)
+            s->cheat_invincible = !off_word(v);
+        if ((v = from_table("cheat_unlimited_ammo")) != NULL)
+            s->cheat_unlimited_ammo = !off_word(v);
+        if ((v = from_table("cheat_all_weapons")) != NULL)
+            s->cheat_all_weapons = !off_word(v);
+        if ((v = from_table("cheat_invisible")) != NULL)
+            s->cheat_invisible = !off_word(v);
+        if ((v = from_table("cheat_level_select")) != NULL)
+            s->cheat_level_select = !off_word(v);
     }
 
     memcpy(g_entries, saved, sizeof saved);
@@ -614,6 +647,19 @@ int recomp_settings_write(const char *path, const RecompSettings *s)
         "# on the internet can join. 0 leaves the router alone. [RECOMP_SYSLINK_UPNP]\n"
         "syslink_upnp = %d\n",
         s->syslink_upnp ? 1 : 0);
+
+    fprintf(f,
+        "\n"
+        "# The game's own cheats, as its Cheats menu would set them. 1 turns\n"
+        "# one on from the start; 0 leaves it to the menu.\n"
+        "cheat_invincible = %d\n"
+        "cheat_unlimited_ammo = %d\n"
+        "cheat_all_weapons = %d\n"
+        "cheat_invisible = %d\n"
+        "cheat_level_select = %d\n",
+        s->cheat_invincible ? 1 : 0, s->cheat_unlimited_ammo ? 1 : 0,
+        s->cheat_all_weapons ? 1 : 0, s->cheat_invisible ? 1 : 0,
+        s->cheat_level_select ? 1 : 0);
 
     fclose(f);
     return 1;

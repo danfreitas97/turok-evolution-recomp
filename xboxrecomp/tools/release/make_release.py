@@ -127,9 +127,12 @@ README = """\
 image (.iso or .xiso) or the folder its files are in. It then builds the game
 from it, which takes a minute or two, and opens the settings; press Play.
 
-What it builds is kept in {userdir}: the game's files, the build, and the
-log (build.log) to attach to a bug report. An image is extracted there once;
-a folder is linked, never copied or changed.
+Choose the installation folder and your ISO, then press Install. Progress and
+live logs are shown while the game is extracted and compiled. The chosen folder
+contains the compiled game, launcher, game files and user settings/saves.
+After installation, run the launcher inside that folder. Copy the entire folder
+to move the game; the original ISO and installer are not needed to play.
+The full installation log is build.log. Keep the installer for future updates.
 
 This release works from these images of the game's default.xbe (SHA-1):
 {hashes}
@@ -486,6 +489,7 @@ def main():
         "title_id": recipe["title_id"],
         "version": version,
         "exe": recipe["exe"],
+        "launcher": recipe["release_name"] + EXE,
         "images": images,
     }
     if lift:

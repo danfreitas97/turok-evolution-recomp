@@ -23,6 +23,12 @@
 #include <stddef.h>   /* ptrdiff_t: not in stdlib.h off MSVC */
 #include <stdlib.h>   /* getenv, exit: the spin verdict below */
 #include <string.h>   /* strcmp: RECOMP_ICALL_FATAL */
+#ifdef _WIN32
+#include <windows.h>  /* CreateThread, Sleep: the Back-to-quit watch */
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
 #ifndef _MSC_VER
 #  include <strings.h>                  /* strncasecmp */
 #  define _strnicmp strncasecmp
@@ -457,6 +463,8 @@ void recomp_icall_not_code_log(uint32_t va, uint32_t saved_esp)
  * the way back out. */
 extern void xbox_D3D8SetWideFrames(int wide);
 extern void xbox_D3D8SetWideFramesAuto(int on);
+static void tk_cheats_apply(void);
+static void tk_quit_screen(const char *name);
 extern void sub_00054A60_gen(void);
 
 static int tk_is_front_end(const char *name)
@@ -495,8 +503,10 @@ void sub_00054A60(void)
 
         snprintf(shown, sizeof shown, "%s", name);
         fprintf(stderr, "[TUROK] screen %s: %s\n", shown, front ? "front end, 4:3" : "game");
+        tk_quit_screen(name);
         xbox_D3D8SetWideFrames(!front);
     }
+    tk_cheats_apply();          /* every screen: the cheats menu shows them */
     sub_00054A60_gen();
 }
 
@@ -521,4 +531,270 @@ void sub_0009C9A0(void)
     xbox_D3D8SetTwoDPlacement(TK_2D_EDGE, 0x0009C9A0u);
     sub_0009C9A0_gen();
     xbox_D3D8SetTwoDPlacement(TK_2D_AUTO, 0);
+}
+
+/* ── Cheats, switched on from the launcher ─────────────────────
+ *
+ * The game has its own cheats, entered as words in its Cheats menu
+ * (Data\Text\Cheats.txm keys 20..28: texas, madman, emerpus, sllewgh,
+ * sellout, heid, hunter, zoo, fmnfb). A word that matches sets item 15 + its
+ * position in $\Data\History\Cheats.hst to 1, which shows that cheat in the
+ * menu (the menu's "allow focus?" links read items 15..20); the menu's
+ * switches then set items 1..6 (1 all weapons, 2 unlimited ammo,
+ * 3 invincible, 4 invisible, 6 big heads; their widgets' W_THI).
+ *
+ * Nothing reads items 1..6 while playing: sub_00153A00, which sets up the
+ * player, copies them once into the player (+0x3BC all weapons, +0x3B8
+ * ammo) and into globals (0x2580DC invincible, 0x257FD0 invisible,
+ * 0x257FE0 big heads). So a cheat chosen in the launcher is written into
+ * Cheats.hst as the menu would have written it, on every screen change and
+ * just before the player is set up, and the game does the rest. A cheat
+ * left off in the launcher is left alone: words typed in the game still
+ * work.
+ *
+ * A history is a vector of 8-byte entries, { value, maximum }, items
+ * counted from 1, under the history manager at [[0x257E14] + 0x80], whose
+ * first two words are the begin and end of its list of histories; each
+ * history names its file at +0x14 and holds its entries' begin and end at
+ * +4 and +8 (sub_00060680 finds one by name, sub_00060700 sets an item and
+ * clamps it to the maximum, sub_000608E0 reads one).
+ *
+ * Settings file keys (or the environment variables beside them):
+ *   cheat_invincible  cheat_unlimited_ammo  cheat_all_weapons
+ *   cheat_invisible   cheat_level_select */
+extern int recomp_config_bool(const char *env_name, const char *key, int fallback);
+extern void sub_00153A00_gen(void);
+
+#define TK_GAME_OBJECT      0x00257E14u
+#define TK_HISTORY_MANAGER  0x80u
+
+typedef struct {
+    const char *env, *key;
+    int item;                   /* the switch, 0 for none */
+    int unlock;                 /* the "shown in the menu" item */
+} TkCheat;
+
+static const TkCheat k_tk_cheats[] = {
+    { "TUROK_CHEAT_ALL_WEAPONS",    "cheat_all_weapons",    1, 15 },   /* texas */
+    { "TUROK_CHEAT_UNLIMITED_AMMO", "cheat_unlimited_ammo", 2, 16 },   /* madman */
+    { "TUROK_CHEAT_INVINCIBLE",     "cheat_invincible",     3, 17 },   /* emerpus */
+    { "TUROK_CHEAT_INVISIBLE",      "cheat_invisible",      4, 18 },   /* sllewgh */
+    { "TUROK_CHEAT_LEVEL_SELECT",   "cheat_level_select",   0, 19 },   /* sellout */
+};
+#define TK_CHEATS ((int)(sizeof k_tk_cheats / sizeof k_tk_cheats[0]))
+
+static uint32_t tk_rd32(uint32_t va)
+{
+    return *(volatile uint32_t *)((uintptr_t)va + g_xbox_mem_offset);
+}
+
+static void tk_wr32(uint32_t va, uint32_t v)
+{
+    *(volatile uint32_t *)((uintptr_t)va + g_xbox_mem_offset) = v;
+}
+
+static int tk_name_is(uint32_t name_va, const char *want)
+{
+    const char *name;
+    size_t n, w = strlen(want);
+
+    if (!name_va)
+        return 0;
+    name = (const char *)((uintptr_t)name_va + g_xbox_mem_offset);
+    n = strnlen(name, 128);
+    return n >= w && _stricmp(name + n - w, want) == 0;
+}
+
+/* Cheats.hst in the history manager, or 0 before the game has loaded it. */
+static uint32_t tk_cheats_history(void)
+{
+    uint32_t game = tk_rd32(TK_GAME_OBJECT), mgr, p, end;
+
+    if (!game || !(mgr = tk_rd32(game + TK_HISTORY_MANAGER)))
+        return 0;
+    p = tk_rd32(mgr);
+    end = tk_rd32(mgr + 4);
+    if (!p || end < p || end - p > 4 * 256)
+        return 0;
+    for (; p < end; p += 4) {
+        uint32_t h = tk_rd32(p);
+
+        if (h && tk_name_is(tk_rd32(h + 0x14), "\\History\\Cheats.hst"))
+            return h;
+    }
+    return 0;
+}
+
+/* Item `item` (from 1) to `value`, held to its maximum as sub_00060700 does. */
+static void tk_history_set(uint32_t h, int item, int value)
+{
+    uint32_t begin = tk_rd32(h + 4), end = tk_rd32(h + 8), e;
+    int max;
+
+    if (item < 1 || end < begin || (end - begin) / 8 < (uint32_t)item)
+        return;
+    e = begin + (uint32_t)(item - 1) * 8;
+    max = (int)tk_rd32(e + 4);
+    tk_wr32(e, (uint32_t)(value > max ? max : value));
+}
+
+static void tk_cheats_apply(void)
+{
+    static int read, on[TK_CHEATS], any;
+    static int reported;
+    uint32_t h;
+    int i;
+
+    if (!read) {
+        read = 1;
+        for (i = 0; i < TK_CHEATS; i++) {
+            on[i] = recomp_config_bool(k_tk_cheats[i].env, k_tk_cheats[i].key, 0);
+            any |= on[i];
+        }
+    }
+    if (!any || !(h = tk_cheats_history()))
+        return;
+    for (i = 0; i < TK_CHEATS; i++) {
+        if (!on[i])
+            continue;
+        tk_history_set(h, k_tk_cheats[i].unlock, 1);
+        if (k_tk_cheats[i].item)
+            tk_history_set(h, k_tk_cheats[i].item, 1);
+    }
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr, "[TUROK] cheats on:%s%s%s%s%s\n",
+                on[0] ? " all-weapons" : "", on[1] ? " unlimited-ammo" : "",
+                on[2] ? " invincible" : "", on[3] ? " invisible" : "",
+                on[4] ? " level-select" : "");
+    }
+}
+
+/* ── Quit: Back on the main menu ───────────────────────────────
+ *
+ * A console game has no Quit. On the main menu Back (the controller's
+ * SELECT, Backspace on the keyboard by default) closes the game, as the
+ * window's close button does. Back has no other use on that screen.
+ *
+ * A small thread reads the four ports as the game sees them (bindings
+ * applied, keyboard included) while the main menu is up, and acts on a press
+ * and release that began after the menu had been up for half a second, so a
+ * Back held while arriving there does nothing. */
+typedef struct {                /* RecompInputGamepad (src/hle/input_model.h) */
+    uint16_t buttons;
+    uint8_t  analog_buttons[8];
+    int16_t  thumb_lx, thumb_ly, thumb_rx, thumb_ry;
+} TkPad;
+
+extern _Bool recomp_input_host_sample_port(unsigned port, TkPad *gamepad);
+extern void xbox_HostExit(const char *why);
+
+#define TK_PAD_BACK 0x0020u
+
+static volatile int      g_tk_on_main_menu;
+static volatile unsigned g_tk_menu_epoch;
+
+static void tk_sleep_ms(unsigned ms)
+{
+#ifdef _WIN32
+    Sleep(ms);
+#else
+    usleep(ms * 1000u);
+#endif
+}
+
+static void tk_quit_watch(void)
+{
+    unsigned epoch = 0, waited = 0;
+    int armed = 0, down = 0;
+
+
+    for (;;) {
+        TkPad pad;
+        unsigned port;
+        int back = 0;
+
+        tk_sleep_ms(30);
+        if (!g_tk_on_main_menu) {
+            armed = down = 0;
+            continue;
+        }
+        if (epoch != g_tk_menu_epoch) {         /* arrived again: wait again */
+            epoch = g_tk_menu_epoch;
+            armed = down = 0;
+            waited = 0;
+        }
+        for (port = 0; port < 4; port++) {
+            memset(&pad, 0, sizeof pad);
+            if (recomp_input_host_sample_port(port, &pad) && (pad.buttons & TK_PAD_BACK))
+                back = 1;
+        }
+        if (!armed) {
+            waited += 30;
+            if (waited >= 500 && !back)
+                armed = 1;
+            continue;
+        }
+        if (back)
+            down = 1;
+        else if (down) {
+            fprintf(stderr, "[TUROK] Back on the main menu: quitting\n");
+            fflush(stderr);
+            xbox_HostExit("Back on the main menu");
+        }
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI tk_quit_thread(LPVOID unused)
+{
+    (void)unused;
+    tk_quit_watch();
+    return 0;
+}
+#else
+static void *tk_quit_thread(void *unused)
+{
+    (void)unused;
+    tk_quit_watch();
+    return NULL;
+}
+#endif
+
+static void tk_quit_screen(const char *name)
+{
+    static int started;
+    const char *base = name, *p;
+
+    for (p = name; *p; p++)
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    g_tk_on_main_menu = _strnicmp(base, "mainmenu", 8) == 0;
+    if (g_tk_on_main_menu)
+        g_tk_menu_epoch++;
+    if (!started) {
+        started = 1;
+#ifdef _WIN32
+        {
+            HANDLE t = CreateThread(NULL, 0, tk_quit_thread, NULL, 0, NULL);
+
+            if (t)
+                CloseHandle(t);
+        }
+#else
+        {
+            pthread_t t;
+
+            if (pthread_create(&t, NULL, tk_quit_thread, NULL) == 0)
+                pthread_detach(t);
+        }
+#endif
+    }
+}
+
+/* The player is set up: Cheats.hst first, so it copies the cheats in. */
+void sub_00153A00(void)
+{
+    tk_cheats_apply();
+    sub_00153A00_gen();
 }

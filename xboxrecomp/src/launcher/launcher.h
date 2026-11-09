@@ -99,5 +99,11 @@ void     lhost_job_cancel(void);
  * the answer arrives through launcher_picked. 0 when there is no dialog --
  * a desktop without one, or Game Mode -- and the path must be typed. */
 int      lhost_pick(int folder);
+/* A shortcut to `target` named `name` where the desktop keeps them: on
+ * Windows the desktop, on Linux the applications menu (and the desktop
+ * folder when there is one). `icon` may be NULL. 1 when one was made; 0 on
+ * a host without them (macOS: the app is its own). */
+int      lhost_shortcut(const char *target, const char *dir, const char *icon,
+                        const char *name);
 
 #endif /* XBOXRECOMP_LAUNCHER_H */

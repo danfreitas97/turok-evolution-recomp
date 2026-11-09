@@ -255,6 +255,15 @@ typedef struct RecompSettings {
     int  syslink_port;          /* the port a host listens on, and joins use */
     char syslink_code[64];      /* the session's join code; empty for none */
     int  syslink_upnp;          /* host: ask the router to forward the port */
+
+    /* The game's own cheats, switched on from the launcher (Turok:
+     * Evolution's src/recomp_manual.c writes them where its Cheats menu
+     * would). 0 leaves them to the game's menu. */
+    int  cheat_invincible;
+    int  cheat_unlimited_ammo;
+    int  cheat_all_weapons;
+    int  cheat_invisible;
+    int  cheat_level_select;
 } RecompSettings;
 
 /* The port a System Link host listens on when nobody chooses one. The same
@@ -307,5 +316,8 @@ void recomp_settings_set_widescreen(RecompSettings *s, int on);
  * otherwise the per-user path for `title_id`. Returns 0 if there is
  * nowhere sensible to put it. */
 int  recomp_settings_path(uint32_t title_id, char *out, size_t n);
+
+/* Call before reading settings; opt in with .turok-portable beside the executable. */
+void recomp_portable_init(const char *executable);
 
 #endif /* XBOXRECOMP_RECOMP_CONFIG_H */

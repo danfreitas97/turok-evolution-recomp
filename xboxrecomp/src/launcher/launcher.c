@@ -141,6 +141,9 @@ static void gpu_choices_load(void)
 }
 
 static Row  g_video_rows[12];
+/* The game's own cheats, as switches (the Cheats tab). */
+static Row  g_cheat_rows[5];
+static int  g_cheat_count;
 static int  g_video_count;
 
 /* ---- System Link ---- */
@@ -285,6 +288,33 @@ static void build_rows(void)
     r++;
 
     g_video_count = (int)(r - g_video_rows);
+
+    /* The game's own cheats (the words its Cheats menu takes), switched on
+     * here for whoever wants them. Off leaves them to that menu. */
+    r = g_cheat_rows;
+    r->label = "Invincible";
+    r->help  = "Enemies and falls cannot hurt you. The game's own cheat (emerpus).";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_invincible;
+    r++;
+    r->label = "Unlimited ammo";
+    r->help  = "Weapons never run out. The game's own cheat (madman).";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_unlimited_ammo;
+    r++;
+    r->label = "All weapons";
+    r->help  = "Every weapon the level has, from the start of it. The game's own"
+               " cheat (texas).";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_all_weapons;
+    r++;
+    r->label = "Invisible";
+    r->help  = "Enemies do not see you. The game's own cheat (sllewgh).";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_invisible;
+    r++;
+    r->label = "Level select";
+    r->help  = "Unlocks level select in the game's Cheats menu, to start any"
+               " level. The game's own cheat (sellout).";
+    r->kind  = ROW_BOOL; r->ival = &g_settings.cheat_level_select;
+    r++;
+    g_cheat_count = (int)(r - g_cheat_rows);
 }
 
 static const char *link_mode_label(int i)
@@ -1289,8 +1319,10 @@ static int pad_poll(int *dx, int *dy, int *accept, int *cancel, int *tab)
 
 /* ----------------------------------------------------------------- state */
 
-typedef enum { TAB_VIDEO, TAB_INPUT, TAB_LINK, TAB_ABOUT, TAB_COUNT } Tab;
-static const char *const k_tab_names[TAB_COUNT] = { "VIDEO", "INPUT", "SYSTEM LINK", "ABOUT" };
+typedef enum { TAB_VIDEO, TAB_INPUT, TAB_LINK, TAB_CHEATS, TAB_ABOUT, TAB_COUNT } Tab;
+static const char *const k_tab_names[TAB_COUNT] = {
+    "VIDEO", "INPUT", "SYSTEM LINK", "CHEATS", "ABOUT"
+};
 
 static Tab    g_tab;
 static Tab    g_tab_from;
@@ -1309,6 +1341,10 @@ static Row *tab_rows(int *count)
     if (g_tab == TAB_LINK) {
         *count = g_link_count;
         return g_link_rows;
+    }
+    if (g_tab == TAB_CHEATS) {
+        *count = g_cheat_count;
+        return g_cheat_rows;
     }
     *count = 0;
     return NULL;
@@ -1428,7 +1464,8 @@ static void rows_for_tab(void)
 {
     g_rows_on_tab = (g_tab == TAB_VIDEO) ? g_video_count
                   : (g_tab == TAB_INPUT) ? BIND_ROWS_VISIBLE
-                  : (g_tab == TAB_LINK)  ? g_link_count : 0;
+                  : (g_tab == TAB_LINK)  ? g_link_count
+                  : (g_tab == TAB_CHEATS) ? g_cheat_count : 0;
     if (g_sel >= g_rows_on_tab)
         g_sel = g_rows_on_tab ? g_rows_on_tab - 1 : 0;
 }
@@ -1821,6 +1858,32 @@ static void release_tick(void)
         /* Built: the game's own files now name it, and the settings are
          * its; then the ordinary launcher, Play and all. */
         g_rel_stale = 0;
+        {
+            char executable[LAUNCHER_PATH + 64];
+            snprintf(executable, sizeof executable, "%s/%s", g_user_dir, g_release_exe);
+            recomp_portable_init(executable);
+            language_save();
+        }
+        /* A shortcut to the launcher the installation now carries, named
+         * as the window is, so the game can be found again. */
+        {
+            char self[LAUNCHER_PATH], target[LAUNCHER_PATH + 64], icon[LAUNCHER_PATH + 64];
+            const char *name = NULL, *p;
+#ifdef _WIN32
+            const char sep = '\\', *icon_file = "icon.ico";
+#else
+            const char sep = '/', *icon_file = "icon.png";
+#endif
+            if (host_exe_path(self, sizeof self)) {
+                for (p = name = self; *p; p++)
+                    if (*p == '/' || *p == '\\')
+                        name = p + 1;
+                snprintf(target, sizeof target, "%s%c%s", g_user_dir, sep, name);
+                snprintf(icon, sizeof icon, "%s%c%s", g_user_dir, sep, icon_file);
+                if (lhost_shortcut(target, g_user_dir, icon, launcher_title()))
+                    fprintf(stderr, "[LAUNCHER] shortcut to %s\n", target);
+            }
+        }
         read_title();
         settings_load();
         build_rows();
@@ -2157,19 +2220,11 @@ static void draw_home(void)
     r.x = 48; r.y = g_ch - 42; r.w = left - 60; r.h = 20;
     theme_text(r, footer, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
 
-    /* The corner: the toolkit and the release, small. */
-    r.x = left; r.y = 12; r.w = g_cw - left - 36; r.h = 18;
-    if (g_release && g_release_version[0])
-        snprintf(line, sizeof line, "DirectXbox-Recomp   |   %s", g_release_version);
-    else
-        snprintf(line, sizeof line, "DirectXbox-Recomp");
-    theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_RIGHT);
-
     x = left + 12;
     w = g_cw - x - 36;
 
     /* The game: ready or not, and how it is set to run. */
-    r.x = x; r.y = 82; r.w = w; r.h = 132;
+    r.x = x; r.y = 82; r.w = w; r.h = 132;     /* under the language buttons */
     c = theme_card(r, "GAME");
     theme_dot(c.x + 6, c.y + 11, 5, game_ready() ? RGB(0x5C, 0xE0, 0x7A) : RGB(0xE0, 0xA0, 0x40));
     r = c; r.x += 20; r.w -= 20; r.h = 22;
@@ -2180,18 +2235,17 @@ static void draw_home(void)
     theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
     cap = g_settings.frame_cap;
     r.y += 22;
-    snprintf(line, sizeof line, "%dx resolution   |   %s   |   %s%s",
-             g_settings.resolution_scale, g_widescreen ? "widescreen" : "4:3",
+    /* How it is set to run, on one line: the card stays three lines high. */
+    snprintf(line, sizeof line, "%dx resolution   |   %s   |   %s%s   |   %s",
+             g_settings.resolution_scale, tr(g_widescreen ? "widescreen" : "4:3"),
              strcmp(cap, "adaptive") == 0 ? "60 fps" : strcmp(cap, "0") == 0 ? "uncapped" : cap,
-             (strcmp(cap, "adaptive") == 0 || strcmp(cap, "0") == 0) ? "" : " fps");
+             (strcmp(cap, "adaptive") == 0 || strcmp(cap, "0") == 0) ? "" : " fps",
+             tr(g_settings.fullscreen ? "Fullscreen" : "In a window"));
     theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
-    r.y += 22;
-    theme_text(r, g_settings.fullscreen ? "Fullscreen" : "In a window", 10, 400,
-               THEME_TEXT_DIM, THEME_LEFT);
 
     /* What the title has to say. */
     if (news_title[0] || news_text[0]) {
-        r.x = x; r.y = 234; r.w = w; r.h = 196;
+        r.x = x; r.y = 232; r.w = w; r.h = 198;
         c = theme_card(r, "NEWS");
         r = c; r.h = 24;
         theme_text(r, news_title, 14, 700, THEME_TEXT, THEME_LEFT);
@@ -2203,10 +2257,10 @@ static void draw_home(void)
     r.x = x; r.y = 450; r.w = w; r.h = 112;
     c = theme_card(r, "CONTROLS");
     theme_text_wrapped(c, g_pad_seen
-        ? "A plays, B quits. The D-pad moves between the buttons. Controls opens "
-          "the bindings for every controller and the keyboard."
-        : "Enter plays, Esc quits, the arrows move between the buttons. A "
-          "controller works here too.",
+        ? "A plays, B quits. The D-pad moves between the buttons. In the game, "
+          "Back on the main menu closes it."
+        : "Enter plays, Esc quits, the arrows move between the buttons. In the "
+          "game, Back (Backspace) on the main menu closes it.",
         11, THEME_TEXT_DIM);
 }
 
@@ -2275,6 +2329,8 @@ static void draw(void)
 
     if (g_tab == TAB_VIDEO) {
         draw_rows(g_video_rows, g_video_count, 0);
+    } else if (g_tab == TAB_CHEATS) {
+        draw_rows(g_cheat_rows, g_cheat_count, 1);
     } else if (g_tab == TAB_LINK) {
         draw_link();
     } else if (g_tab == TAB_INPUT) {
@@ -2551,8 +2607,17 @@ void launcher_init(void)
 {
     const char *build;
 
-    language_load();
+    {
+        char executable[LAUNCHER_PATH];
+        if (host_exe_path(executable, sizeof executable)) recomp_portable_init(executable);
+    }
     release_init();
+    if (g_release) {
+        char executable[LAUNCHER_PATH + 64];
+        snprintf(executable, sizeof executable, "%s/%s", g_user_dir, g_release_exe);
+        recomp_portable_init(executable);
+    }
+    language_load();
     read_title();
 #ifdef LAUNCHER_HAS_BRAND
     {

@@ -589,7 +589,6 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
-    WCHAR save_base[MAX_PATH];
 
     /* The fallbacks used to name Burnout 3 specifically, so any other title
      * that passed NULL silently pointed its game dir and its saves at another
@@ -621,8 +620,9 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
-        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
-            swprintf_s(s_save_dir, MAX_PATH, L"%s\\xboxrecomp", save_base);
+        char portable_or_default[MAX_PATH];
+        if (recomp_data_dir(portable_or_default, sizeof portable_or_default)) {
+            MultiByteToWideChar(CP_UTF8, 0, portable_or_default, -1, s_save_dir, MAX_PATH);
         } else {
             GetCurrentDirectoryW(MAX_PATH, s_save_dir);
             wcscat_s(s_save_dir, MAX_PATH, L"\\SaveData");
