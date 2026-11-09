@@ -121,8 +121,12 @@ built by an older release and builds it again; settings and saves are kept.
   installation folder.
 - A black window and nothing else: attach `turok_recomp.log` from the same
   folder.
-- A rendering bug in one place: press F11 there, and attach the `.bmp` and
-  `.d3dcap` files it writes beside the game.
+- A rendering bug in one place: press F11 there. It writes a picture of the
+  frame (`frame000.bmp`, then `frame001.bmp`, ...) and a capture of it
+  (`frame000.d3dcap`, ...) beside the game. Attach the picture, zipped or
+  saved as PNG (GitHub does not take `.bmp`), and `turok_recomp.log`. Keep
+  the `.d3dcap` to yourself unless someone working on the port asks for it:
+  it holds the frame's textures, which are the game's.
 
 ## Releases of the game
 

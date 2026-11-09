@@ -124,8 +124,12 @@ mantidos.
 - A instalação falha: abra uma issue e anexe o `build.log` da pasta de
   instalação.
 - Só uma janela preta: anexe o `turok_recomp.log` da mesma pasta.
-- Um erro de imagem num lugar específico: aperte F11 ali e anexe os arquivos
-  `.bmp` e `.d3dcap` que ele grava ao lado do jogo.
+- Um erro de imagem num lugar específico: aperte F11 ali. Ele grava ao lado do
+  jogo uma imagem do quadro (`frame000.bmp`, depois `frame001.bmp`, ...) e
+  uma captura dele (`frame000.d3dcap`, ...). Anexe a imagem, num
+  `.zip` ou salva como PNG (o GitHub não aceita `.bmp`), e o
+  `turok_recomp.log`. Não publique o `.d3dcap`, a não ser que alguém que
+  trabalha no port peça: ele guarda as texturas do quadro, que são do jogo.
 
 ## Versões do jogo
 
