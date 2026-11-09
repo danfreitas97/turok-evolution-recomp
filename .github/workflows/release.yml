@@ -153,10 +153,37 @@ jobs:
     needs: [linux, macos, windows]
     runs-on: ubuntu-24.04
     steps:
+      # For the version's section of CHANGELOG.md and CHANGELOG.pt-BR.md.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: archives
           merge-multiple: true
+
+      # The notes are the launcher's NEWS card too (src/launcher/launcher.c,
+      # news_from_notes): English, then "### Português (Brasil)", then "---"
+      # and how to install, which the card leaves out.
+      - name: Write the release notes
+        run: |
+          ver="${VERSION#v}"
+          section() {
+            awk -v v="$ver" '
+              /^## / { if (on) exit; if ($2 == v || $2 == "v" v) on = 1; next }
+              on' "$1"
+          }
+          {
+            section CHANGELOG.md
+            printf '\n### Português (Brasil)\n\n'
+            section CHANGELOG.pt-BR.md
+            printf '\n---\n\n'
+            printf '%s\n' "Turok: Evolution, USA (NTSC) release. Point the installer at your own disc image and it builds the game on your machine, once. Windows is the tested platform; the Linux and Mac builds are experimental and have not been tried with this port yet."
+            printf '\n%s\n' "- Windows (64-bit, 10 or 11): unzip turok-$VERSION-windows-x86_64.zip and run turok.exe. It is not signed: if Windows says it protected your PC, choose More info, then Run anyway."
+            printf '%s\n' "- Linux: unpack turok-$VERSION-linux-x86_64.tar.xz and run ./turok."
+            printf '%s\n' "- Mac (Apple Silicon, macOS 13 or later): unpack turok-$VERSION-macos-arm64.tar.xz, move Turok Evolution.app to Applications, and before opening it the first time run xattr -dr com.apple.quarantine \"/Applications/Turok Evolution.app\" in Terminal (it is not signed with an Apple Developer ID)."
+            printf '\n%s\n' "Updating: run the new installer and choose the folder you installed to. Your saves and settings are kept. See README.txt inside."
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
 
       - name: Publish
         env:
@@ -166,5 +193,5 @@ jobs:
           ls -l archives
           gh release view "$VERSION" >/dev/null 2>&1 || \
             gh release create "$VERSION" --title "$VERSION" --verify-tag \
-              --notes "Turok: Evolution, USA (NTSC) release. Point the installer at your own disc image and it builds the game on your machine, once. Windows is the tested platform; the Linux and Mac builds are experimental and have not been tried with this port yet. Linux: unpack turok-$VERSION-linux-x86_64.tar.xz and run ./turok. Windows (64-bit, 10 or 11): unzip turok-$VERSION-windows-x86_64.zip and run turok.exe (it is not signed: if Windows says it protected your PC, choose More info, Run anyway). Mac (Apple Silicon, macOS 13 or later): unpack turok-$VERSION-macos-arm64.tar.xz, move Turok Evolution.app to Applications, and before opening it the first time run xattr -dr com.apple.quarantine \"/Applications/Turok Evolution.app\" in Terminal (it is not signed with an Apple Developer ID). See README.txt inside."
+              --notes-file "$RUNNER_TEMP/notes.md"
           gh release upload "$VERSION" archives/*.tar.xz archives/*.zip --clobber

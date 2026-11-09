@@ -599,6 +599,8 @@ static int json_str(const char *text, const char *key, char *out, size_t n)
 
         if (c == '\\' && *p) {
             c = *p++;
+            if (c == 'r')
+                continue;
             if (c == 'n') c = '\n';
             else if (c == 't') c = ' ';
             else if (c == 'u') {            /* \uXXXX: kept only if ASCII */
@@ -2165,8 +2167,104 @@ static int g_home_sel;          /* 0 Play, 1 Settings, 2 Controls, 3 Update */
 static volatile long g_update_state;    /* 0 idle, 1 asking, 2 newer found, 3 none */
 static char g_update_current[96], g_update_tag[96], g_update_url[512];
 
+/* The latest release's notes (its CHANGELOG section, written by the release
+ * workflow): English first, then a "### Português (Brasil)" part, then
+ * "---" and how to install. The NEWS card shows the part in the launcher's
+ * language, as plain text. Set before g_update_state leaves 1. */
+static char g_news_en[2048], g_news_pt[2048];
+static int  g_news_ok;
+static int  g_news_skip;                /* lines scrolled off the top of the card */
+static ThemeRect g_news_rect;           /* where the notes were drawn last */
+
+/* The front page's cards, top to bottom on the right. */
+#define NEWS_Y      232
+#define NEWS_H      250
+#define CONTROLS_Y  (NEWS_Y + NEWS_H + 18)
+
+#define NEWS_PT_HEADING "### Português (Brasil)"
+
+/* text[0..n) as plain lines: headings without their #, list items with a
+ * bullet, ** and ` dropped, blank lines at the ends and runs of them gone. */
+static void news_plain(const char *text, size_t n, char *out, size_t size)
+{
+    const char *p = text, *end = text + n;
+    size_t k = 0;
+    int blank = 1;                      /* nothing written yet counts as blank */
+    int heading = 0;                    /* the line above was a heading */
+
+    if (!size)
+        return;
+    while (p < end && k + 8 < size) {
+        const char *eol = memchr(p, '\n', (size_t)(end - p));
+        const char *q = p, *stop;
+
+        if (!eol)
+            eol = end;
+        while (q < eol && (*q == ' ' || *q == '\t'))
+            q++;
+        if (q == eol) {                 /* blank line */
+            if (!blank && k + 1 < size)
+                out[k++] = '\n', blank = 1;
+            p = eol + 1;
+            continue;
+        }
+        if (*q == '#') {
+            while (q < eol && *q == '#')
+                q++;
+            while (q < eol && *q == ' ')
+                q++;
+            heading = 1;
+        } else if ((*q == '-' || *q == '*') && q + 1 < eol && q[1] == ' ') {
+            memcpy(out + k, "\xE2\x80\xA2 ", 4);  /* U+2022 bullet */
+            k += 4;
+            q += 2;
+            heading = 0;
+        } else if (!blank && !heading && k && out[k - 1] == '\n') {
+            out[k - 1] = ' ';           /* a wrapped line goes on the one above */
+        } else {
+            heading = 0;
+        }
+        for (stop = eol; q < stop && k + 2 < size; q++) {
+            if (*q == '`' || (*q == '*' && q + 1 < stop && q[1] == '*')) {
+                if (*q == '*')
+                    q++;
+                continue;
+            }
+            out[k++] = *q;
+        }
+        out[k++] = '\n';
+        blank = 0;
+        p = eol + 1;
+    }
+    while (k && out[k - 1] == '\n')
+        k--;
+    out[k] = '\0';
+}
+
+static void news_from_notes(const char *body)
+{
+    const char *pt = strstr(body, NEWS_PT_HEADING);
+    const char *rule = strstr(body, "\n---");
+    const char *en_end = pt ? pt : rule ? rule : body + strlen(body);
+
+    if (rule && rule < en_end)
+        en_end = rule;
+    news_plain(body, (size_t)(en_end - body), g_news_en, sizeof g_news_en);
+    g_news_pt[0] = '\0';
+    if (pt) {
+        const char *start = pt + strlen(NEWS_PT_HEADING);
+        const char *stop = strstr(start, "\n---");
+
+        if (!stop)
+            stop = start + strlen(start);
+        news_plain(start, (size_t)(stop - start), g_news_pt, sizeof g_news_pt);
+    }
+    g_news_ok = g_news_en[0] != '\0';
+}
+
 /* "v1.2.10" against "1.2.9": numbers compared in turn. A version that is not
- * numbers (a test build) counts as older than any release. */
+ * numbers (a test build) counts as older than any release, and one with a
+ * suffix ("1.0.0-rc2") as older than the release it leads up to. */
 static int version_newer(const char *tag, const char *have)
 {
     const char *a = tag, *b = have;
@@ -2185,12 +2283,12 @@ static int version_newer(const char *tag, const char *have)
         if (*a == '.') a++; else if (*a) break;
         if (*b == '.') b++; else if (*b) break;
     }
-    return 0;
+    return !*a && *b == '-';
 }
 
 static void update_thread(void)
 {
-    static char body[64 * 1024];
+    static char body[64 * 1024], notes[16 * 1024];
     long state = 3;
 #ifdef LAUNCHER_HAS_BRAND
     char url[300];
@@ -2202,9 +2300,12 @@ static void update_thread(void)
     snprintf(url, sizeof url, "https://api.github.com/repos/%s/releases/latest", repo);
     if (lhost_http_get(url, body, sizeof body) > 0 &&
         json_str(body, "tag_name", g_update_tag, sizeof g_update_tag) &&
-        json_str(body, "html_url", g_update_url, sizeof g_update_url) &&
-        version_newer(g_update_tag, g_update_current))
-        state = 2;
+        json_str(body, "html_url", g_update_url, sizeof g_update_url)) {
+        if (json_str(body, "body", notes, sizeof notes))
+            news_from_notes(notes);
+        if (version_newer(g_update_tag, g_update_current))
+            state = 2;
+    }
 #endif
     lhost_publish(&g_update_state, state);
 }
@@ -2247,6 +2348,84 @@ static int update_offered(void)
     return lhost_read(&g_update_state) == 2;
 }
 
+/* The latest release's notes, in the launcher's language, or NULL. */
+static const char *news_notes(void)
+{
+    long s = lhost_read(&g_update_state);
+
+    if ((s != 2 && s != 3) || !g_news_ok)
+        return NULL;
+    return g_language && g_news_pt[0] ? g_news_pt : g_news_en;
+}
+
+/* The notes from the line the wheel has scrolled to (one line, which is one
+ * item of the list, a notch), and how many lines there are to scroll. */
+static const char *news_scrolled(const char *notes)
+{
+    int i;
+
+    for (i = 0; i < g_news_skip && notes; i++) {
+        const char *nl = strchr(notes, '\n');
+
+        if (!nl)
+            break;
+        notes = nl + 1;
+        while (*notes == '\n')
+            notes++;
+    }
+    return notes;
+}
+
+/* Whether `text`, wrapped into `r` at the cards' 11 px, runs past its
+ * bottom. An estimate, from an average letter width and line height, since
+ * the hosts' text drawing measures nothing back: enough to say there is
+ * more to scroll to. */
+static int news_overflows(const char *text, ThemeRect r)
+{
+    int per_line = r.w * 10 / 62, lines = 0, room = r.h / 19, chars = 0;
+
+    if (per_line < 10)
+        per_line = 10;
+    for (; text && *text; text++) {
+        if (*text == '\n') {
+            lines += chars ? (chars + per_line - 1) / per_line : 1;
+            chars = 0;
+        } else if (((unsigned char)*text & 0xC0) != 0x80) {
+            chars++;                    /* a letter, not a UTF-8 continuation */
+        }
+    }
+    lines += chars ? (chars + per_line - 1) / per_line : 0;
+    return lines > room;
+}
+
+/* The notes in `r`, scrolled, with an arrow at the right where there is
+ * more above or below. */
+static void news_draw(ThemeRect r, const char *notes)
+{
+    const char *shown = news_scrolled(notes);
+    ThemeRect a = r;
+
+    r.w -= 18;
+    g_news_rect = r;
+    theme_text_wrapped(r, shown, 11, THEME_TEXT_DIM);
+    a.x = a.x + a.w - 14; a.w = 14; a.h = 16;
+    if (g_news_skip > 0)
+        theme_text(a, "\xE2\x96\xB2", 10, 400, THEME_GREEN, THEME_CENTRE);
+    a.y = r.y + r.h - 16;
+    if (news_overflows(shown, r))
+        theme_text(a, "\xE2\x96\xBC", 10, 400, THEME_GREEN, THEME_CENTRE);
+}
+
+static int news_lines(const char *notes)
+{
+    int n = 1;
+
+    for (; notes && *notes; notes++)
+        if (*notes == '\n' && notes[1] && notes[1] != '\n')
+            n++;
+    return n;
+}
+
 static int home_left(void) { return g_cw * 46 / 100; }
 
 static ThemeRect home_rect(int i)
@@ -2258,7 +2437,7 @@ static ThemeRect home_rect(int i)
         int left = home_left() + 12;
 
         r.x = left + 20; r.w = 240; r.h = 40;
-        r.y = 232 + 198 - 14 - 40;
+        r.y = NEWS_Y + NEWS_H - 14 - 40;
         return r;
     }
     r.x = 48; r.w = w; r.h = 68;
@@ -2354,20 +2533,34 @@ static void draw_home(void)
              tr(g_settings.fullscreen ? "Fullscreen" : "In a window"));
     theme_text(r, line, 10, 400, THEME_TEXT_DIM, THEME_LEFT);
 
-    /* What the title has to say, or that a newer release is out. */
+    /* That a newer release is out, what the latest one brought (its
+     * notes, from GitHub), or the title's own words when offline. */
     if (update_offered()) {
-        r.x = x; r.y = 232; r.w = w; r.h = 198;
+        const char *notes = news_notes();
+
+        r.x = x; r.y = NEWS_Y; r.w = w; r.h = NEWS_H;
         c = theme_card(r, "NEWS");
         r = c; r.h = 24;
         snprintf(line, sizeof line, "Version %s is available", g_update_tag);
         theme_text(r, line, 14, 700, THEME_TEXT, THEME_LEFT);
-        r = c; r.y += 32; r.h = 60;
-        theme_text_wrapped(r, "Download the new installer and choose this same folder: the "
-                              "game is built again and your saves and settings are kept.",
-                           11, THEME_TEXT_DIM);
+        r = c; r.y += 30; r.h = home_rect(3).y - 8 - r.y;
+        if (notes)
+            news_draw(r, notes);
+        else
+            theme_text_wrapped(r, "Download the new installer and choose this same folder: "
+                                  "the game is built again and your saves and settings are "
+                                  "kept.", 11, THEME_TEXT_DIM);
         theme_button(home_rect(3), "Download update", 1, g_home_sel == 3 ? 1.0 : 0.0);
+    } else if (news_notes()) {
+        r.x = x; r.y = NEWS_Y; r.w = w; r.h = NEWS_H;
+        c = theme_card(r, "NEWS");
+        r = c; r.h = 24;
+        snprintf(line, sizeof line, "What's new in %s", g_update_tag);
+        theme_text(r, line, 14, 700, THEME_TEXT, THEME_LEFT);
+        r = c; r.y += 30; r.h = c.h - 30;
+        news_draw(r, news_notes());
     } else if (news_title[0] || news_text[0]) {
-        r.x = x; r.y = 232; r.w = w; r.h = 198;
+        r.x = x; r.y = NEWS_Y; r.w = w; r.h = NEWS_H;
         c = theme_card(r, "NEWS");
         r = c; r.h = 24;
         theme_text(r, news_title, 14, 700, THEME_TEXT, THEME_LEFT);
@@ -2376,7 +2569,7 @@ static void draw_home(void)
     }
 
     /* How to drive it, for the pad or the keyboard in front of it. */
-    r.x = x; r.y = 450; r.w = w; r.h = 112;
+    r.x = x; r.y = CONTROLS_Y; r.w = w; r.h = 112;
     c = theme_card(r, "CONTROLS");
     theme_text_wrapped(c, g_pad_seen
         ? "A plays, B quits. The D-pad moves between the buttons. In the game, "
@@ -2964,11 +3157,30 @@ void launcher_hover(int mx, int my)
 /* The wheel scrolls the one list that is longer than the window, the Input
  * tab's, a row a notch. The selection stays on its row while that row is
  * still in view, and the row under the pointer is then lit as a move would
- * light it. The other tabs fit, so the wheel has nothing to do there. */
+ * light it. The other tabs fit, so the wheel has nothing to do there.
+ *
+ * On the front page it scrolls the release notes in the NEWS card, under
+ * the pointer, a line of them a notch. */
 void launcher_wheel(int rows, int mx, int my)
 {
     int last = BIND_TOTAL_ROWS - BIND_ROWS_VISIBLE, top, k;
 
+    if (rows && g_home) {
+        int x = home_left() + 12;
+
+        if (news_notes() && mx >= x && mx < g_cw - 36 &&
+            my >= NEWS_Y && my < NEWS_Y + NEWS_H) {
+            int n = news_lines(news_notes());
+
+            /* Down only while the end is not in view yet. */
+            if (rows > 0 && !news_overflows(news_scrolled(news_notes()), g_news_rect))
+                rows = 0;
+            g_news_skip += rows;
+            if (g_news_skip > n - 1) g_news_skip = n - 1;
+            if (g_news_skip < 0) g_news_skip = 0;
+        }
+        return;
+    }
     if (!rows || g_tab != TAB_INPUT || g_capturing)
         return;
     if (last < 0)

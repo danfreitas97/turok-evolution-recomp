@@ -205,7 +205,10 @@ the last stage, which is enough after a change to `src/recomp_manual.c`.
 
 ## Making a release
 
-Pushing a version tag (`git tag v1.0 && git push origin v1.0`) runs
+First add the version's section to `CHANGELOG.md` and `CHANGELOG.pt-BR.md`
+(`## 1.0.1` and a list): it becomes the release notes, and the launcher shows
+it in its NEWS card. Then pushing a version tag
+(`git tag v1.0.1 && git push origin v1.0.1`) runs
 `.github/workflows/release.yml`, which builds the installer from
 `release/turok.json` and attaches it to the tag's GitHub release. No game
 files are involved. How the installer works is in

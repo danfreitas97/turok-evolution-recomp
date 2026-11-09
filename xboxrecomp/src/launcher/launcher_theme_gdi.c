@@ -133,7 +133,7 @@ void theme_text_wrapped(ThemeRect r, const char *text, int size, COLORREF colour
     rc.top = r.y;
     rc.right = r.x + r.w;
     rc.bottom = r.y + r.h;
-    draw_utf8(text, &rc, DT_WORDBREAK | DT_TOP | DT_NOPREFIX);
+    draw_utf8(text, &rc, DT_WORDBREAK | DT_TOP | DT_NOPREFIX | DT_EDITCONTROL);
     SelectObject(g_dc, old);
     DeleteObject(font);
 }

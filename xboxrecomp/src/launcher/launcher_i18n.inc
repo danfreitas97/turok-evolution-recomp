@@ -186,6 +186,7 @@ static const struct { const char *en, *pt; } k_translations[] = {
     {"Version %s is available", "Versão %s disponível"},
     {"Download the new installer and choose this same folder: the game is built again and your saves and settings are kept.", "Baixe o novo instalador e escolha esta mesma pasta: o jogo é compilado de novo e seus saves e configurações são mantidos."},
     {"Download update", "Baixar atualização"},
+    {"What's new in %s", "Novidades da versão %s"},
     {"CHEATS", "CHEATS"},
     {"Invincible", "Invencível"},
     {"Unlimited ammo", "Munição infinita"},

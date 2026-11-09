@@ -130,8 +130,8 @@ if(COMMAND recomp_add_launcher)
         BRAND_MOTES      4DFF7C
         BRAND_TITLE      "Turok Evolution Recomp"
         BRAND_FOOTER     "Fan project, not affiliated with Acclaim or the owners of Turok."
-        BRAND_NEWS_TITLE "USA (NTSC) port in progress"
-        BRAND_NEWS_TEXT  "Built from your own disc on your own computer. Online play is in development."
+        BRAND_NEWS_TITLE "Turok: Evolution, USA (NTSC)"
+        BRAND_NEWS_TEXT  "Built from your own disc on your own computer. What each new version brings shows here when the launcher is online."
         BRAND_UPDATE_REPO danfreitas97/turok-evolution-recomp)
 endif()
 

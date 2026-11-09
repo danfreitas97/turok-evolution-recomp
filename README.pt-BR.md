@@ -209,7 +209,10 @@ py -3 scripts/build.py --game "C:/caminho/do/disco/extraido" --relift
 
 ## Fazer um release
 
-Enviar uma tag de versão (`git tag v1.0 && git push origin v1.0`) roda o
+Antes, coloque a seção da versão no `CHANGELOG.md` e no `CHANGELOG.pt-BR.md`
+(`## 1.0.1` e uma lista): ela vira as notas do release, e o launcher a mostra
+no card NOVIDADES. Depois, enviar uma tag de versão
+(`git tag v1.0.1 && git push origin v1.0.1`) roda o
 `.github/workflows/release.yml`, que monta o instalador a partir de
 `release/turok.json` e o anexa ao release da tag no GitHub. Nenhum arquivo do
 jogo é envolvido. Como o instalador funciona está em
